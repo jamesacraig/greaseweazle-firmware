@@ -11,6 +11,11 @@
 
 unsigned int usb_bulk_mps = USB_FS_MPS;
 
+/* Default personality is USB Mass-Storage so the device is bootable as a disk.
+ * Eject the medium (SCSI START/STOP) to drop back to the CDC tool interface. */
+volatile uint8_t usb_mode = USB_MODE_MSC;
+volatile uint8_t usb_mode_req = USB_MODE_MSC;
+
 struct ep0 ep0;
 
 void usb_init(void)
@@ -48,15 +53,20 @@ static bool_t handle_control_request(void)
         uint8_t type = req->wValue >> 8;
         uint8_t idx = req->wValue;
         if ((type == DESC_DEVICE) && (idx == 0)) {
-            ep0.data_len = device_descriptor[0]; /* bLength */
-            memcpy(ep0.data, device_descriptor, ep0.data_len);
+            const uint8_t *d = (usb_mode == USB_MODE_MSC)
+                ? msc_device_descriptor : device_descriptor;
+            ep0.data_len = d[0]; /* bLength */
+            memcpy(ep0.data, d, ep0.data_len);
         } else if ((type == DESC_DEVICE_QUALIFIER) && (idx == 0)) {
             if ((handled = hw_has_highspeed())) {
                 ep0.data_len = device_qualifier[0]; /* bLength */
                 memcpy(ep0.data, device_qualifier, ep0.data_len);
             }
         } else if ((type == DESC_CONFIGURATION) && (idx == 0)) {
-            if (usb_is_highspeed()) {
+            if (usb_mode == USB_MODE_MSC) {
+                ep0.data_len = msc_config_descriptor[2]; /* wTotalLength */
+                memcpy(ep0.data, msc_config_descriptor, ep0.data_len);
+            } else if (usb_is_highspeed()) {
                 ep0.data_len = config_hs_descriptor[2]; /* wTotalLength */
                 memcpy(ep0.data, config_hs_descriptor, ep0.data_len);
             } else {
@@ -89,11 +99,13 @@ static bool_t handle_control_request(void)
     } else if ((req->bmRequestType == 0x00)
               && (req->bRequest == SET_CONFIGURATION)) {
 
-        handled = cdc_acm_set_configuration();
+        handled = (usb_mode == USB_MODE_MSC)
+            ? msc_set_configuration() : cdc_acm_set_configuration();
 
     } else if ((req->bmRequestType&0x7f) == 0x21) {
 
-        handled = cdc_acm_handle_class_request();
+        handled = (usb_mode == USB_MODE_MSC)
+            ? msc_handle_class_request() : cdc_acm_handle_class_request();
 
     } else {
 

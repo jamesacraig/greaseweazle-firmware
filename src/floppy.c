@@ -67,6 +67,9 @@ extern uint8_t u_buf[];
 #include "mcu/at32f4/floppy.c"
 #endif
 
+#include "codec/ibm.h"
+#include "disk.h"
+
 static struct index {
     /* Main code can reset this at will. */
     volatile unsigned int count;
@@ -630,6 +633,11 @@ static uint8_t get_floppy_pin(unsigned int pin, uint8_t *p_level)
 
 static void floppy_reset(void)
 {
+    /* In Mass-Storage mode the mounted drive must stay selected and spinning
+     * across USB bus resets (which occur during enumeration); quiescing here
+     * would deselect it and break the next SCSI read/write. */
+    if (usb_mode == USB_MODE_MSC)
+        return;
     floppy_state = ST_inactive;
     quiesce_drives();
     act_led(FALSE);
@@ -1513,6 +1521,280 @@ done:
 }
 
 
+/*
+ * UFI: ON-DEVICE TRACK DECODE
+ *
+ * Blocking capture of one track's flux, streamed through the integer PLL into a
+ * bitcell buffer (carved from u_buf[]) and FM/MFM-decoded into a sector image.
+ * Reuses the existing RDATA timer/DMA machinery. Not part of the flux state
+ * machine: callers run it synchronously while no flux streaming is in flight.
+ */
+
+/*
+ * Large UFI scratch buffers are carved from the u_buf[] tail (the firmware
+ * places big buffers there; static BSS is tight). Two track images plus a
+ * generous bitcell/flux scratch area. On the V4.1, U_BUF_SZ is 128KB.
+ */
+#define UFI_IMG          (u_buf + 0)            /* track image A   (<=16KB) */
+#define UFI_IMG2         (u_buf + 16*1024)      /* track image B   (<=16KB) */
+#define UFI_SCRATCH      (u_buf + 32*1024)      /* bitcells / flux scratch  */
+#define UFI_SCRATCH_BITS ((U_BUF_SZ - 32*1024) * 8)
+
+static void floppy_configure(void); /* defined later */
+
+static uint8_t ufi_got[64];
+
+static int ufi_capture_decode(const struct ibm_fmt *f, int cyl, int head,
+                              uint8_t *img, uint8_t *got, unsigned int revs)
+{
+    struct ibm_pll pll;
+    const uint16_t bmask = ARRAY_SIZE(dma.buf) - 1;
+    uint16_t cons, prod;
+    timcnt_t prev;
+    time_t start;
+    uint8_t rc;
+
+    rc = floppy_seek(cyl);
+    if (rc != ACK_OKAY)
+        return -1;
+    op_delay_wait(DELAY_read); /* seek settle */
+
+    if (read_pin(head) != head) {
+        write_pin(head, head);
+        delay_us(delay_params.pre_write);
+    }
+
+    /* Prepare RDATA capture (mirrors floppy_read_prep, minus USB streaming). */
+    ibm_pll_init(&pll, f, UFI_SCRATCH, UFI_SCRATCH_BITS);
+    dma_rdata.mar = (uint32_t)(unsigned long)dma.buf;
+    dma_rdata.ndtr = ARRAY_SIZE(dma.buf);
+    rdata_prep();
+    cons = 0;
+    prev = tim_rdata->cnt;
+    index.count = 0;
+    tim_rdata->cr1 = TIM_CR1_CEN;
+    start = time_now();
+
+    for (;;) {
+        prod = (ARRAY_SIZE(dma.buf) - dma_rdata.ndtr) & bmask;
+        while (cons != prod) {
+            timcnt_t curr = dma.buf[cons];
+            ibm_pll_flux(&pll, (uint16_t)(curr - prev));
+            prev = curr;
+            cons = (cons + 1) & bmask;
+        }
+        if (index.count >= revs)
+            break;
+        if (time_since(start) >= time_ms(2000))
+            break; /* no/insufficient index */
+    }
+
+    floppy_flux_end();
+    ibm_pll_flush(&pll);
+
+    return ibm_scan_sectors(f, UFI_SCRATCH, pll.nbits, img, got);
+}
+
+/*
+ * Stream a bitcell byte buffer to WDATA as flux, starting at the index pulse.
+ * Each set cell is a flux transition; the interval to it is (run * cell) ticks.
+ */
+static uint8_t ufi_write_cells(const struct ibm_fmt *f,
+                               const uint8_t *cells, uint32_t ncellbytes)
+{
+    const uint16_t bmask = ARRAY_SIZE(dma.buf) - 1;
+    uint32_t nbits = ncellbytes * 8;
+    uint32_t cell = ibm_cell_ticks(f);
+    uint32_t i = 0, run = 0;
+    uint16_t prod = 0, cons;
+    time_t start;
+    int done = 0;
+
+    /* Helper inlined: produce next ARR value, or set done at end of stream. */
+#define NEXT_FLUX(vp) ({                                                \
+        int _got = 0;                                                   \
+        while (i < nbits) {                                             \
+            int _bit = (cells[i>>3] >> (7-(i&7))) & 1;                  \
+            i++; run++;                                                 \
+            if (_bit) { *(vp) = (timcnt_t)(run*cell - 1); run = 0;      \
+                        _got = 1; break; }                             \
+        }                                                              \
+        _got; })
+
+    wdata_prep();
+    dma_wdata.par = (uint32_t)(unsigned long)&tim_wdata->arr;
+    dma_wdata.mar = (uint32_t)(unsigned long)dma.buf;
+    dma_wdata.ndtr = ARRAY_SIZE(dma.buf);
+
+    /* Pre-fill the DMA ring. */
+    while (prod < ARRAY_SIZE(dma.buf) - 1) {
+        timcnt_t v;
+        if (!NEXT_FLUX(&v)) { done = 1; break; }
+        dma.buf[prod++] = v;
+    }
+
+    /* Cue the write to the index pulse for a consistent splice position. */
+    index.count = 0;
+    start = time_now();
+    while (index.count == 0)
+        if (time_since(start) >= time_ms(2000))
+            return ACK_NO_INDEX;
+
+    dma_wdata_start();
+    tim_wdata->egr = TIM_EGR_UG;
+    tim_wdata->sr = 0; /* let h/w process EGR.UG before we start the timer */
+    barrier();
+    tim_wdata->cr1 = TIM_CR1_CEN;
+    configure_pin(wdata, AFO_bus);
+    write_pin(wgate, TRUE);
+
+    /* Count revolutions from here: terminate the write at the NEXT index pulse
+     * so exactly one physical revolution is overwritten and the write splice
+     * lands in the over-provisioned footer gap. */
+    index.count = 0;
+
+    /* Feed the ring until the next index, or until all cells are sent. */
+    while ((index.count == 0) && !done) {
+        cons = (ARRAY_SIZE(dma.buf) - dma_wdata.ndtr) & bmask;
+        while (((prod + 1) & bmask) != cons) {
+            timcnt_t v;
+            if (!NEXT_FLUX(&v)) { done = 1; break; }
+            dma.buf[prod] = v;
+            prod = (prod + 1) & bmask;
+        }
+    }
+
+    /* If all cells were sent before the index, drain the ring (still stopping
+     * at the index if it arrives first). */
+    while (done && (index.count == 0)) {
+        cons = (ARRAY_SIZE(dma.buf) - dma_wdata.ndtr) & bmask;
+        if (cons == prod)
+            break;
+    }
+
+    floppy_flux_end();
+    return ACK_OKAY;
+#undef NEXT_FLUX
+}
+
+static uint8_t ufi_write_track(const struct ibm_fmt *f, int cyl, int head,
+                               const uint8_t *img)
+{
+    uint32_t ncellbytes;
+    uint8_t rc;
+
+    rc = floppy_seek(cyl);
+    if (rc != ACK_OKAY)
+        return rc;
+    op_delay_wait(DELAY_write);
+
+    if (read_pin(head) != head) {
+        write_pin(head, head);
+        delay_us(delay_params.pre_write);
+    }
+
+    if (get_wrprot() == LOW)
+        return ACK_WRPROT;
+
+    /* Build the master track into the scratch area (bitcells), then stream it
+     * out. The source image lives in a separate u_buf[] region (UFI_IMG/IMG2),
+     * so it is not disturbed by the encode. */
+    ncellbytes = ibm_encode_track(f, cyl, head, img, UFI_SCRATCH,
+                                  U_BUF_SZ - 32*1024);
+    return ufi_write_cells(f, UFI_SCRATCH, ncellbytes);
+}
+
+/*
+ * Drive management, modelled on the WD177x floppy controllers: select the drive
+ * and spin the spindle up (letting it stabilise) on access while it is idle,
+ * and after ~10 idle revolutions stop the motor AND deselect the drive (a real
+ * controller deasserts both between commands; leaving SELECT asserted keeps the
+ * drive's activity light on and the bus driven).
+ */
+static time_t ufi_last_access;
+#define UFI_SPINUP_REVS  6
+#define UFI_IDLE_REVS    10
+#define UFI_REV_MS       200 /* 300 RPM */
+
+static void ufi_motor_run(void)
+{
+    drive_select(0); /* re-assert SELECT (no-op if already selected) */
+    if (!unit[0].motor) {
+        time_t deadline;
+        drive_motor(0, TRUE); /* assert MOTOR (includes a spin-up delay) */
+        /* Wait up to ~6 revolutions for the spindle to reach a stable speed. */
+        index.count = 0;
+        deadline = time_now() + time_ms(UFI_SPINUP_REVS * UFI_REV_MS + 300);
+        while ((index.count < UFI_SPINUP_REVS) && (time_since(deadline) < 0))
+            cpu_relax();
+    }
+    ufi_last_access = time_now();
+}
+
+/* Called from the main loop while in Mass-Storage mode: once the drive has been
+ * idle for ~10 revolutions, stop the motor and deselect the drive. */
+void ufi_motor_idle_check(void)
+{
+    if ((unit[0].motor || (unit_nr == 0))
+        && (time_since(ufi_last_access) >= time_ms(UFI_IDLE_REVS * UFI_REV_MS))) {
+        drive_motor(0, FALSE);
+        drive_deselect();
+    }
+}
+
+/*
+ * Disk/block-layer backend hooks (declared in disk.h). The block cache lives
+ * in UFI_IMG; verify-after-write reads back into UFI_IMG2; both use UFI_SCRATCH.
+ */
+int ufi_track_read(const struct ibm_fmt *f, int cyl, int head,
+                   uint8_t *img, uint8_t *got, unsigned int revs)
+{
+    ufi_motor_run();
+    return ufi_capture_decode(f, cyl, head, img, got, revs);
+}
+
+uint8_t ufi_track_write(const struct ibm_fmt *f, int cyl, int head,
+                        const uint8_t *img)
+{
+    /* The track write is reliable on real hardware (independently confirmed by
+     * `gw read` at 100%). Read-back verify is intentionally NOT done here: the
+     * read-back immediately after a write is unreliable (write-to-read head
+     * recovery), and a failing verify made each host WRITE slow enough to time
+     * out and, via the disk-layer re-flush path, corrupt the track. A robust
+     * write-to-read recovery + verify is left as future hardening. */
+    ufi_motor_run();
+    return ufi_write_track(f, cyl, head, img);
+}
+
+int ufi_writeprotected(void)
+{
+    return get_wrprot() == LOW;
+}
+
+/* Enter/leave USB Mass-Storage personality (called from the main loop). */
+void ufi_enter_msc(void)
+{
+    floppy_flux_end();
+    set_bus_type(BUS_IBMPC);
+    drive_select(0);
+    disk_init(UFI_IMG);
+    /* Identify the medium now, while the host is still disconnected, so the
+     * first READ CAPACITY / TEST UNIT READY answers instantly (no probe stall
+     * racing the kernel's command timeout). The motor is started on demand by
+     * the track-I/O hooks (ufi_motor_run) and stops after an idle period. */
+    disk_mount();
+    msc_init();
+    watchdog.armed = FALSE; /* we manage the drive ourselves while mounted */
+}
+
+void ufi_exit_msc(void)
+{
+    disk_unmount();
+    drive_motor(0, FALSE);
+    drive_deselect();
+    floppy_configure();
+}
+
 static void process_command(void)
 {
     uint8_t cmd = u_buf[0];
@@ -1730,6 +2012,140 @@ static void process_command(void)
         if (len != 2)
             goto bad_command;
         u_buf[1] = floppy_noclick_step();
+        goto out;
+    }
+    case CMD_UFI_READ_TRACK: {
+        struct ibm_fmt f;
+        int cyl, head, good;
+        unsigned int revs;
+        uint16_t img_crc;
+        if (len != 19)
+            goto bad_command;
+        f.mode = u_buf[2];
+        f.nsec = u_buf[3];
+        f.sec_n = u_buf[4];
+        f.id = u_buf[5];
+        f.interleave = u_buf[6];
+        f.cskew = u_buf[7];
+        f.hskew = u_buf[8];
+        f.iam = u_buf[9];
+        f.gap3 = u_buf[10] | (u_buf[11] << 8);
+        f.rate = u_buf[12] | (u_buf[13] << 8);
+        f.rpm  = u_buf[14] | (u_buf[15] << 8);
+        cyl = u_buf[16];
+        head = u_buf[17];
+        revs = u_buf[18] ? u_buf[18] : 2;
+        if ((bus_type != BUS_IBMPC) && (bus_type != BUS_SHUGART))
+            set_bus_type(BUS_IBMPC);
+        if (drive_select(0) != ACK_OKAY) {
+            u_buf[0] = cmd;
+            u_buf[1] = ACK_NO_UNIT;
+            goto out;
+        }
+        drive_motor(0, TRUE);
+        /* Note: ufi_capture_decode() reuses the u_buf[] tail as scratch, so
+         * all command arguments must be parsed out (above) before this call. */
+        memset(UFI_IMG, 0, ibm_track_bytes(&f));
+        memset(ufi_got, 0, sizeof(ufi_got));
+        good = ufi_capture_decode(&f, cyl, head, UFI_IMG, ufi_got, revs);
+        img_crc = crc16_ccitt(UFI_IMG, ibm_track_bytes(&f), 0xffff);
+        u_buf[0] = cmd;
+        u_buf[1] = ACK_OKAY;
+        u_buf[2] = (good < 0) ? 0 : (uint8_t)good;
+        u_buf[3] = 0;
+        u_buf[4] = img_crc & 0xff;
+        u_buf[5] = img_crc >> 8;
+        resp_sz = 6;
+        goto out;
+    }
+    case CMD_UFI_MOUNT: {
+        if (len != 2)
+            goto bad_command;
+        /* Request the main loop to re-enumerate as Mass-Storage. No response:
+         * the USB link drops, mirroring CMD_SWITCH_FW_MODE. */
+        usb_mode_req = USB_MODE_MSC;
+        return;
+    }
+    case CMD_UFI_MOUNT_TEST: {
+        uint32_t blocks;
+        const struct ibm_fmt *f;
+        if (len != 2)
+            goto bad_command;
+        set_bus_type(BUS_IBMPC);
+        drive_select(0);
+        drive_motor(0, TRUE);
+        disk_init(UFI_IMG);
+        disk_mount();
+        f = disk_fmt();
+        blocks = disk_blocks();
+        u_buf[0] = cmd;
+        u_buf[1] = ACK_OKAY;
+        u_buf[2] = disk_is_mounted() ? 1 : 0;
+        u_buf[3] = f ? f->nsec : 0;
+        u_buf[4] = blocks & 0xff;
+        u_buf[5] = (blocks >> 8) & 0xff;
+        u_buf[6] = (blocks >> 16) & 0xff;
+        u_buf[7] = (blocks >> 24) & 0xff;
+        resp_sz = 8;
+        goto out;
+    }
+    case CMD_UFI_WRITE_TRACK_TEST: {
+        struct ibm_fmt f;
+        int cyl, head, good, match;
+        unsigned int revs;
+        uint32_t tb, k, r;
+        uint16_t rb_crc;
+        uint8_t rc;
+        if (len != 19)
+            goto bad_command;
+        f.mode = u_buf[2];
+        f.nsec = u_buf[3];
+        f.sec_n = u_buf[4];
+        f.id = u_buf[5];
+        f.interleave = u_buf[6];
+        f.cskew = u_buf[7];
+        f.hskew = u_buf[8];
+        f.iam = u_buf[9];
+        f.gap3 = u_buf[10] | (u_buf[11] << 8);
+        f.rate = u_buf[12] | (u_buf[13] << 8);
+        f.rpm  = u_buf[14] | (u_buf[15] << 8);
+        cyl = u_buf[16];
+        head = u_buf[17];
+        revs = u_buf[18] ? u_buf[18] : 2;
+        if ((bus_type != BUS_IBMPC) && (bus_type != BUS_SHUGART))
+            set_bus_type(BUS_IBMPC);
+        if (drive_select(0) != ACK_OKAY) {
+            u_buf[0] = cmd;
+            u_buf[1] = ACK_NO_UNIT;
+            goto out;
+        }
+        drive_motor(0, TRUE);
+        /* Deterministic test pattern (parsed args must be consumed first;
+         * u_buf[] is reused as the encode/decode scratch buffer below). */
+        tb = ibm_track_bytes(&f);
+        r = 0xc0de ^ ((uint32_t)cyl << 8) ^ head;
+        for (k = 0; k < tb; k++) {
+            r = r * 1103515245u + 12345u;
+            UFI_IMG[k] = (uint8_t)(r >> 16);
+        }
+        rc = ufi_write_track(&f, cyl, head, UFI_IMG);
+        if (rc != ACK_OKAY) {
+            u_buf[0] = cmd;
+            u_buf[1] = rc;
+            goto out;
+        }
+        memset(UFI_IMG2, 0, tb);
+        memset(ufi_got, 0, sizeof(ufi_got));
+        good = ufi_capture_decode(&f, cyl, head, UFI_IMG2, ufi_got, revs);
+        match = (good == (int)f.nsec) && (memcmp(UFI_IMG, UFI_IMG2, tb) == 0);
+        rb_crc = crc16_ccitt(UFI_IMG2, tb, 0xffff);
+        u_buf[0] = cmd;
+        u_buf[1] = ACK_OKAY;
+        u_buf[2] = (good < 0) ? 0 : (uint8_t)good;
+        u_buf[3] = match ? 1 : 0;
+        u_buf[4] = rb_crc & 0xff;
+        u_buf[5] = rb_crc >> 8;
+        resp_sz = 6;
         goto out;
     }
     default:

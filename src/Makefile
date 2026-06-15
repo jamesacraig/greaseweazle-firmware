@@ -22,7 +22,9 @@ else
 
 OBJS += main.o
 OBJS += floppy.o
+OBJS += disk.o
 OBJS += testmode.o
+SUBDIRS += codec
 
 endif
 

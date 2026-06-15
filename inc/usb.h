@@ -21,6 +21,30 @@ struct usb_class_ops {
 };
 extern const struct usb_class_ops usb_cdc_acm_ops;
 
+/*
+ * Runtime device personality. The device enumerates as either the CDC-ACM
+ * Greaseweazle (default) or a USB Mass-Storage (UFI) disk. usb_mode_req is set
+ * to request a switch; the main loop applies it by re-initialising USB.
+ */
+#define USB_MODE_CDC 0
+#define USB_MODE_MSC 1
+extern volatile uint8_t usb_mode;
+extern volatile uint8_t usb_mode_req;
+
+/* Mass Storage class (msc.c) */
+void msc_init(void);
+void msc_process(void);
+bool_t msc_set_configuration(void);
+bool_t msc_handle_class_request(void);
+extern const uint8_t msc_device_descriptor[];
+extern const uint8_t msc_config_descriptor[];
+
+/* Personality transition hooks (floppy.c): set up / tear down the drive. */
+void ufi_enter_msc(void);
+void ufi_exit_msc(void);
+/* Spin the drive motor down after an idle period (call from the main loop). */
+void ufi_motor_idle_check(void);
+
 /* USB Endpoints for CDC ACM communications. */
 #define EP_RX 2
 #define EP_TX 3

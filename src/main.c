@@ -41,12 +41,36 @@ int main(void)
     printk("** https://github.com/keirf/Greaseweazle\n\n");
 
     floppy_init();
+
+    /* Set up the default personality before enumerating. Defaulting to
+     * Mass-Storage makes the device bootable as a disk. */
+    if (usb_mode == USB_MODE_MSC)
+        ufi_enter_msc();
     usb_init();
 
     for (;;) {
         canary_check();
+
         usb_process();
-        floppy_process();
+
+        /* Apply a requested personality switch (CDC <-> Mass-Storage) by
+         * re-initialising USB so the host re-enumerates the new device. */
+        if (usb_mode_req != usb_mode) {
+            usb_deinit();
+            if (usb_mode_req == USB_MODE_MSC)
+                ufi_enter_msc();
+            else
+                ufi_exit_msc();
+            usb_mode = usb_mode_req;
+            usb_init();
+        }
+
+        if (usb_mode == USB_MODE_MSC) {
+            msc_process();
+            ufi_motor_idle_check();
+        } else {
+            floppy_process();
+        }
     }
 
     return 0;

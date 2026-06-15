@@ -74,12 +74,29 @@
 /* CMD_TEST_MODE, length=10, 0x6e504b4e, 0x382910d3 
  * Responds ACK_OKAY and then switches to board test mode until reset. */
 #define CMD_TEST_MODE      21
-/* CMD_NOCLICK_STEP, length=2 
+/* CMD_NOCLICK_STEP, length=2
  * Steps outward from cylinder 0. This is expected to be ignored by the drive,
- * but will reset the Disk Change signal if a disk has been inserted. 
+ * but will reset the Disk Change signal if a disk has been inserted.
  * On successful return the drive is always at cylinder 0. */
 #define CMD_NOCLICK_STEP   22
-#define CMD_MAX            22
+/* CMD_UFI_READ_TRACK, length=19. [UFI/debug] On-device decode of one track.
+ * Args (after cmd,len): struct gw_ufi_read (see below). Selects IBMPC bus
+ * unit 0, captures flux, FM/MFM-decodes it on the device, and returns 4 bytes
+ * after ACK: u8 good_sectors, u8 reserved, u16 crc16_ccitt(track image). */
+#define CMD_UFI_READ_TRACK 23
+/* CMD_UFI_WRITE_TRACK_TEST, length=19. [UFI/debug] DESTRUCTIVE: writes a test
+ * pattern to one track (use only on scratch media), reads it back, and decodes
+ * it on the device. Args: struct gw_ufi_read. Returns 4 bytes after ACK:
+ * u8 good_sectors, u8 verify_match (1=read-back == written), u16 readback crc. */
+#define CMD_UFI_WRITE_TRACK_TEST 24
+/* CMD_UFI_MOUNT, length=2. Switch the device into USB Mass-Storage (UFI) mode:
+ * it re-enumerates as a removable disk. No response (the USB link resets).
+ * The host returns to CDC mode by ejecting the disk (SCSI START/STOP eject). */
+#define CMD_UFI_MOUNT      25
+/* CMD_UFI_MOUNT_TEST, length=2. [debug] Run the disk-layer auto-detect in CDC
+ * mode. Returns 6 bytes after ACK: u8 mounted, u8 nsec, u32 block_count(LE). */
+#define CMD_UFI_MOUNT_TEST 26
+#define CMD_MAX            26
 
 
 /*
@@ -220,6 +237,24 @@ struct packed gw_erase_flux {
 struct packed gw_sink_source_bytes {
     uint32_t nr_bytes;
     uint32_t seed;
+};
+
+/* CMD_UFI_READ_TRACK: a fixed IBM FM/MFM track format + which track to read. */
+struct packed gw_ufi_read {
+    uint8_t mode;        /* 0=FM, 1=MFM */
+    uint8_t nsec;        /* sectors per track */
+    uint8_t sec_n;       /* sector size = 128 << sec_n */
+    uint8_t id;          /* sector-id (R) of logical sector 0 */
+    uint8_t interleave;
+    uint8_t cskew;
+    uint8_t hskew;
+    uint8_t iam;         /* nonzero: track has an Index Address Mark */
+    uint16_t gap3;
+    uint16_t rate;       /* data rate, kbps */
+    uint16_t rpm;
+    uint8_t cyl;
+    uint8_t head;
+    uint8_t revs;        /* revolutions to capture (0 -> default 2) */
 };
 
 /* CMD_{GET,SET}_PARAMS, index 0 */
