@@ -23,8 +23,45 @@ Built and tested on a **Greaseweazle V4.1** (AT32F403A). The codec is integer-on
 
 The device **defaults to USB Mass-Storage** (so it is bootable as a disk). To get
 back to the normal CDC/serial interface for the `gw` host tool (and for firmware
-updates), **eject the medium** (e.g. `eject /dev/sdX`), which returns it to CDC.
-`CMD_UFI_MOUNT` switches CDC → Mass-Storage on demand.
+updates) — e.g. for full-rate flux imaging — switch to CDC by any of:
+
+- **eject the medium** (`eject /dev/sdX`), or
+- the explicit vendor SCSI command **`0xC0` SET MODE** (`test/ufi_scsi.py cdc`).
+
+`CMD_UFI_MOUNT` (`test/ufi_mount.py`) switches CDC → Mass-Storage on demand.
+
+(A combined CDC+MSC *composite* device was prototyped but reverted: the
+AT32F403A's 512-byte USB packet buffer can't hold double-buffered CDC bulk
+endpoints — needed for flux streaming — alongside the MSC endpoints, so the two
+personalities are kept separate, each at full capability.)
+
+## Format control (no eject)
+
+The disk format is normally **auto-detected** from track 0, but the host can
+select or describe a format over the standard USB-floppy (UFI) SCSI mechanism —
+no eject, no firmware rebuild:
+
+- **READ FORMAT CAPACITIES (`0x23`)** lists the built-in formats as capacity
+  descriptors (block counts).
+- **FORMAT UNIT (`0x04`)** selects one — *non-destructively*, it just sets the
+  decode/encode geometry and raises UNIT ATTENTION so the host re-reads the size:
+  - send only the standard capacity descriptor → the device maps the block count
+    to a built-in format; or
+  - append a **vendor format descriptor** (signature `0xA5`: encoding FM/MFM/
+    Amiga, cylinders, heads, sectors/track, sector size, id base, interleave,
+    skews, IAM, gap3, rate, rpm, flags) → the device applies *any* IBM-family or
+    Amiga geometry, so a one-off format needs no firmware change; or
+  - send no parameter list → re-run auto-detection.
+
+The `test/ufi_scsi.py` helper drives all of this via `SG_IO`:
+
+```
+ufi_scsi.py list                    # enumerate formats + current capacity
+ufi_scsi.py format "PC 720K"        # force a built-in (by name or block count)
+ufi_scsi.py describe 1 80 2 9 2 1 1 0 0 1 84 250 300 0   # arbitrary format
+ufi_scsi.py auto                    # re-auto-detect
+ufi_scsi.py cdc                     # switch to CDC mode
+```
 
 ## Formats (validated on real hardware)
 

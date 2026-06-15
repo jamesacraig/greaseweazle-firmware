@@ -34,6 +34,7 @@ int ufi_writeprotected(void);
 struct disk_cand {
     const char *name;
     uint16_t cyls;        /* nominal cylinder count for this family */
+    uint8_t nheads;       /* nominal head count (for the capacity list) */
     struct ibm_fmt f;
     /* sequential: lay the two sides out one-after-another (all of head 0, then
      * all of head 1) instead of interleaved per cylinder. DFS double-sided
@@ -44,16 +45,20 @@ struct disk_cand {
 
 static const struct disk_cand cands[] = {
     /* AmigaDOS 880K: 250kbps DD MFM, Amiga track structure (codec = AMIGA). */
-    { "AmigaDOS 880K",  80, { IBM_MFM, 11, 2, 0, 1, 0, 0, 0,   0, 250, 300,
-                              IBM_CODEC_AMIGA }, 0 },
-    /* name           cyls  mode    nsec sec_n id il ck hk iam gap3 rate rpm  seq */
-    { "PC 1.44M",       80, { IBM_MFM, 18, 2, 1, 1, 0, 0, 1,  84, 500, 300 }, 0 },
-    { "PC 720K",        80, { IBM_MFM,  9, 2, 1, 1, 0, 0, 1,  84, 250, 300 }, 0 },
-    { "Acorn ADFS 800K",80, { IBM_MFM,  5, 3, 0, 1, 0, 0, 1, 116, 250, 300 }, 0 },
-    { "Acorn ADFS 1600",80, { IBM_MFM, 10, 3, 0, 1, 0, 0, 1, 116, 500, 300 }, 0 },
-    { "Acorn ADFS 256", 80, { IBM_MFM, 16, 1, 0, 1, 0, 0, 1,  57, 250, 300 }, 0 },
-    { "Acorn DFS",      80, { IBM_FM,  10, 1, 0, 1, 3, 0, 0,  21, 125, 300 }, 1 },
+    { "AmigaDOS 880K",  80, 2, { IBM_MFM, 11, 2, 0, 1, 0, 0, 0,   0, 250, 300,
+                                 IBM_CODEC_AMIGA }, 0 },
+    /* name           cyls hd  mode    nsec sec_n id il ck hk iam gap3 rate rpm  seq */
+    { "PC 1.44M",       80, 2, { IBM_MFM, 18, 2, 1, 1, 0, 0, 1,  84, 500, 300 }, 0 },
+    { "PC 720K",        80, 2, { IBM_MFM,  9, 2, 1, 1, 0, 0, 1,  84, 250, 300 }, 0 },
+    { "Acorn ADFS 800K",80, 2, { IBM_MFM,  5, 3, 0, 1, 0, 0, 1, 116, 250, 300 }, 0 },
+    { "Acorn ADFS 1600",80, 2, { IBM_MFM, 10, 3, 0, 1, 0, 0, 1, 116, 500, 300 }, 0 },
+    { "Acorn ADFS 256", 80, 2, { IBM_MFM, 16, 1, 0, 1, 0, 0, 1,  57, 250, 300 }, 0 },
+    { "Acorn DFS",      80, 2, { IBM_FM,  10, 1, 0, 1, 3, 0, 0,  21, 125, 300 }, 1 },
 };
+#define NR_CANDS (sizeof(cands)/sizeof(cands[0]))
+
+/* Largest track image the cache buffer (UFI_IMG) can hold. */
+#define MAX_TRACK_BYTES 16384
 
 static struct {
     int mounted;
@@ -97,11 +102,86 @@ int disk_mount_forced(const struct ibm_fmt *f, uint16_t cyls, uint8_t heads)
     return 0;
 }
 
+/* Nominal full-geometry block count of a built-in candidate. */
+static uint32_t cand_blocks(const struct disk_cand *c)
+{
+    uint32_t tb = (uint32_t)c->f.nsec << (7 + c->f.sec_n); /* nsec*(128<<sec_n) */
+    return (uint32_t)c->cyls * c->nheads * (tb / DISK_BLOCK_SIZE);
+}
+
+int disk_num_formats(void) { return (int)NR_CANDS; }
+
+int disk_format_info(unsigned int idx, uint32_t *blocks, const char **name)
+{
+    if (idx >= NR_CANDS)
+        return -1;
+    if (blocks)
+        *blocks = cand_blocks(&cands[idx]);
+    if (name)
+        *name = cands[idx].name;
+    return 0;
+}
+
+/* Select a built-in format by its (unique) nominal block count. */
+int disk_mount_capacity(uint32_t blocks)
+{
+    unsigned int i;
+    for (i = 0; i < NR_CANDS; i++) {
+        if (cand_blocks(&cands[i]) == blocks) {
+            disk_unmount();
+            set_geometry(&cands[i].f, cands[i].cyls, cands[i].nheads,
+                         cands[i].sequential);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* Apply a host-described format. The geometry is validated and its track image
+ * must fit the cache buffer; the block mapping requires a whole number of
+ * 512-byte blocks per track. */
+int disk_mount_described(const struct ufi_format_desc *d)
+{
+    struct ibm_fmt f;
+    uint32_t tb;
+
+    if (d->encoding > 2)                      /* FM / MFM / Amiga */
+        return -1;
+    if ((d->nsec == 0) || (d->nsec > 64))     /* got[] is 64 entries */
+        return -1;
+    if (d->sec_n > 6)
+        return -1;
+    if ((d->cyls == 0) || (d->cyls > 84))
+        return -1;
+    if ((d->heads == 0) || (d->heads > 2))
+        return -1;
+    tb = (uint32_t)d->nsec << (7 + d->sec_n); /* nsec * (128 << sec_n) */
+    if ((tb > MAX_TRACK_BYTES) || (tb % DISK_BLOCK_SIZE) != 0)
+        return -1;
+
+    f.mode = (d->encoding == 0) ? IBM_FM : IBM_MFM;
+    f.codec = (d->encoding == 2) ? IBM_CODEC_AMIGA : IBM_CODEC_IBM;
+    f.nsec = d->nsec;
+    f.sec_n = d->sec_n;
+    f.id = d->id;
+    f.interleave = d->interleave;
+    f.cskew = d->cskew;
+    f.hskew = d->hskew;
+    f.iam = d->iam;
+    f.gap3 = d->gap3;
+    f.rate = d->rate ? d->rate : 250;
+    f.rpm = d->rpm ? d->rpm : 300;
+
+    disk_unmount();
+    set_geometry(&f, d->cyls, d->heads, d->flags & UFI_FMT_FLAG_SEQUENTIAL);
+    return 0;
+}
+
 int disk_mount(void)
 {
     unsigned int i;
     disk_unmount();
-    for (i = 0; i < sizeof(cands)/sizeof(cands[0]); i++) {
+    for (i = 0; i < NR_CANDS; i++) {
         const struct ibm_fmt *f = &cands[i].f;
         uint8_t got[64];
         int heads;

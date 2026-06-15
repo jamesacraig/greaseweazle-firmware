@@ -110,6 +110,7 @@ static enum {
     ST_DATA_IN,     /* sending data to host */
     ST_DATA_OUT,    /* receiving data from host */
     ST_DATA_IN_FAIL,/* terminate a failed data-in phase with a zero-length pkt */
+    ST_FORMAT_OUT,  /* receiving a FORMAT UNIT parameter list */
     ST_CSW,         /* send Command Status Wrapper */
 } st;
 
@@ -121,6 +122,8 @@ static uint32_t io_blocks;    /* blocks still to fetch/store from disk */
 static uint32_t buf_off;      /* byte offset within blkbuf */
 static uint32_t data_total;   /* total bytes to transfer in the data phase */
 static uint32_t xferred;      /* bytes transferred in the data phase so far */
+static uint8_t fmt_buf[40];   /* FORMAT UNIT parameter list */
+static uint32_t fmt_got, fmt_total;
 
 /* usb_mode / usb_mode_req / USB_MODE_* come from usb.h (via decls.h). */
 
@@ -224,13 +227,63 @@ static void scsi_read_capacity(void)
 static void scsi_read_format_capacities(void)
 {
     uint8_t *b = blkbuf;
-    uint32_t blocks = disk_blocks();
-    memset(b, 0, 12);
-    b[3] = 8;              /* capacity list length */
-    be32(b + 4, blocks);   /* number of blocks */
-    b[8] = blocks ? 0x02 : 0x03; /* 02 formatted media, 03 no media */
+    uint32_t cur = disk_blocks();
+    int n = disk_num_formats(), i, off;
+
+    /* Capacity List Header (4 bytes). */
+    b[0] = b[1] = b[2] = 0;
+    b[3] = (uint8_t)(8 * (1 + n));   /* length of the descriptors that follow */
+    /* Current / Maximum Capacity Descriptor (8 bytes). */
+    be32(b + 4, cur);
+    b[8] = cur ? 0x02 : 0x03;        /* 02 formatted media, 03 no media */
     b[9] = 0; b[10] = (DISK_BLOCK_SIZE >> 8); b[11] = (DISK_BLOCK_SIZE & 0xff);
-    begin_data_in(12);
+    /* One Formattable Capacity Descriptor per built-in format. */
+    off = 12;
+    for (i = 0; i < n; i++) {
+        uint32_t blocks = 0;
+        disk_format_info((unsigned int)i, &blocks, 0);
+        be32(b + off, blocks);
+        b[off+4] = 0;                /* descriptor type 0 (formattable) */
+        b[off+5] = 0;
+        b[off+6] = (DISK_BLOCK_SIZE >> 8); b[off+7] = (DISK_BLOCK_SIZE & 0xff);
+        off += 8;
+    }
+    begin_data_in(off);
+}
+
+/* Apply a received FORMAT UNIT parameter list. With our vendor format
+ * descriptor present (signature 0xA5 at offset 12) the host fully describes the
+ * format; otherwise the standard capacity descriptor's block count selects a
+ * built-in. Non-destructive: only the decode/encode geometry changes. */
+static void apply_format_unit(void)
+{
+    int rc = -1;
+    if ((fmt_got >= 30) && (fmt_buf[12] == 0xa5)) {
+        struct ufi_format_desc d;
+        d.encoding   = fmt_buf[13];
+        d.cyls       = fmt_buf[14];
+        d.heads      = fmt_buf[15];
+        d.nsec       = fmt_buf[16];
+        d.sec_n      = fmt_buf[17];
+        d.id         = fmt_buf[18];
+        d.interleave = fmt_buf[19];
+        d.cskew      = fmt_buf[20];
+        d.hskew      = fmt_buf[21];
+        d.iam        = fmt_buf[22];
+        d.gap3       = fmt_buf[23] | ((uint16_t)fmt_buf[24] << 8);
+        d.rate       = fmt_buf[25] | ((uint16_t)fmt_buf[26] << 8);
+        d.rpm        = fmt_buf[27] | ((uint16_t)fmt_buf[28] << 8);
+        d.flags      = fmt_buf[29];
+        rc = disk_mount_described(&d);
+    } else if (fmt_got >= 12) {
+        rc = disk_mount_capacity(rd_be32(fmt_buf + 4));
+    }
+    if (rc == 0) {
+        ua_pending = TRUE;           /* host re-reads the new geometry */
+        SENSE_OK(); csw.status = 0;
+    } else {
+        SENSE_ILLEGAL_REQ(); csw.status = 1;
+    }
 }
 
 static void scsi_mode_sense6(void)
@@ -283,7 +336,9 @@ static void scsi_dispatch(void)
      * Only the active-access commands (READ CAPACITY / READ / WRITE) may pulse
      * STEP to probe for a newly inserted disk; passive readiness polls never
      * move the head, so an idle empty drive stays silent. */
-    if (cb[0] != 0x12 && cb[0] != 0x03) {
+    /* FORMAT UNIT (0x04, has a data-out phase to drain) and the vendor mode
+     * switch (0xc0) must run regardless of a pending UA, like INQUIRY/SENSE. */
+    if (cb[0] != 0x12 && cb[0] != 0x03 && cb[0] != 0x04 && cb[0] != 0xc0) {
         int active = (cb[0] == 0x25 || cb[0] == 0x28 || cb[0] == 0x2a);
         int chg = ufi_media_check(active);
         if (chg) {
@@ -337,6 +392,29 @@ static void scsi_dispatch(void)
         break;
 
     case 0x1e: /* PREVENT ALLOW MEDIUM REMOVAL */
+        st = ST_CSW;
+        break;
+
+    case 0x04: /* FORMAT UNIT */
+        /* With a parameter list, select/describe the format (non-destructive);
+         * with none, re-run auto-detect. */
+        if (cbw.len == 0) {
+            disk_mount();
+            if (disk_is_mounted()) { ua_pending = TRUE; SENSE_OK(); csw.status = 0; }
+            else { SENSE_NOT_READY(); csw.status = 1; }
+            st = ST_CSW;
+        } else {
+            fmt_got = 0;
+            fmt_total = cbw.len;
+            st = ST_FORMAT_OUT;
+        }
+        break;
+
+    case 0xc0: /* [vendor] SET MODE: cb[1]=0 -> switch to CDC (flux imaging) */
+        if (cb[1] == 0) {
+            disk_unmount();
+            usb_mode_req = USB_MODE_CDC;
+        }
         st = ST_CSW;
         break;
 
@@ -473,6 +551,27 @@ void msc_process(void)
         }
         if (xferred >= data_total) {
             disk_flush();
+            st = ST_CSW;
+        }
+        break;
+
+    case ST_FORMAT_OUT:
+        /* Receive a FORMAT UNIT parameter list (small; stored up to fmt_buf, any
+         * excess discarded by the short read), then apply it. */
+        len = ep_rx_ready(MSC_EP_OUT);
+        if (len < 0)
+            break;
+        {
+            uint32_t room = (fmt_got < sizeof(fmt_buf))
+                          ? sizeof(fmt_buf) - fmt_got : 0;
+            uint32_t take = ((uint32_t)len < room) ? (uint32_t)len : room;
+            /* usb_read consumes the packet (re-arms the EP) even for take<len. */
+            usb_read(MSC_EP_OUT, fmt_buf + (room ? fmt_got : 0), take);
+            fmt_got += (uint32_t)len;
+        }
+        if (fmt_got >= fmt_total) {
+            xferred = fmt_total;
+            apply_format_unit();
             st = ST_CSW;
         }
         break;

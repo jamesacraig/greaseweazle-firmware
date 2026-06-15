@@ -42,6 +42,42 @@ int disk_mount_forced(const struct ibm_fmt *f, uint16_t cyls, uint8_t heads);
 /* Flush and forget the current medium (e.g. on eject / mode exit). */
 void disk_unmount(void);
 
+/* Host-describable format (the vendor part of a SCSI FORMAT UNIT parameter
+ * list). Lets the host select ANY IBM-family / Amiga format without a firmware
+ * rebuild: the device just applies the geometry to its codecs. */
+struct ufi_format_desc {
+    uint8_t encoding;    /* 0=FM, 1=MFM, 2=Amiga */
+    uint8_t cyls;
+    uint8_t heads;       /* 1 or 2 */
+    uint8_t nsec;        /* sectors per track */
+    uint8_t sec_n;       /* sector size = 128 << sec_n */
+    uint8_t id;          /* sector-id (R) of logical sector 0 */
+    uint8_t interleave;
+    uint8_t cskew;
+    uint8_t hskew;
+    uint8_t iam;         /* nonzero: track has an Index Address Mark */
+    uint16_t gap3;       /* 0 => codec default */
+    uint16_t rate;       /* data rate kbps (0 => 250) */
+    uint16_t rpm;        /* 0 => 300 */
+    uint8_t flags;       /* bit0: sequential side layout (DFS); bit1: ignore IDAM
+                          * head field (default behaviour) */
+};
+#define UFI_FMT_FLAG_SEQUENTIAL  (1u<<0)
+#define UFI_FMT_FLAG_IGNORE_HEAD (1u<<1)
+
+/* Apply a host-described format (non-destructive: just sets decode/encode
+ * geometry). Returns 0 on success, <0 if the descriptor is invalid or its track
+ * image would not fit the cache buffer. */
+int disk_mount_described(const struct ufi_format_desc *d);
+/* Select a built-in format by its (unique) logical block count. <0 if none. */
+int disk_mount_capacity(uint32_t blocks);
+
+/* Built-in format table introspection (for READ FORMAT CAPACITIES and helpers). */
+int disk_num_formats(void);
+/* Nominal capacity (full-geometry block count) of built-in format `idx`, and its
+ * name. Returns 0 on success, <0 if idx is out of range. */
+int disk_format_info(unsigned int idx, uint32_t *blocks, const char **name);
+
 int disk_is_mounted(void);
 int disk_is_writeprotected(void);
 uint32_t disk_blocks(void);            /* number of 512-byte logical blocks */
