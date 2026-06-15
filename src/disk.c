@@ -55,6 +55,8 @@ static const struct disk_cand cands[] = {
     { "Acorn DFS",      80, { IBM_FM,  10, 1, 0, 1, 3, 0, 0,  21, 125, 300 }, 1 },
 };
 
+#define NR_CANDS (sizeof(cands)/sizeof(cands[0]))
+
 static struct {
     int mounted;
     struct ibm_fmt f;
@@ -67,6 +69,7 @@ static struct {
     uint8_t got[64];          /* per-logical-sector valid flags for cache */
     int dirty;
     uint8_t sequential;       /* sides laid out sequentially (DFS double-sided) */
+    int fmt_idx;              /* index into cands[] of mounted format, -1 if none */
 } D;
 
 void disk_init(uint8_t *cache_buf)
@@ -74,6 +77,7 @@ void disk_init(uint8_t *cache_buf)
     memset(&D, 0, sizeof(D));
     D.cache = cache_buf;
     D.cyl = D.head = -1;
+    D.fmt_idx = -1;
 }
 
 static void set_geometry(const struct ibm_fmt *f, uint16_t cyls, uint8_t heads,
@@ -94,6 +98,33 @@ int disk_mount_forced(const struct ibm_fmt *f, uint16_t cyls, uint8_t heads)
 {
     disk_unmount();
     set_geometry(f, cyls, heads, 0);
+    D.fmt_idx = -1;
+    return 0;
+}
+
+/* Probe how many heads carry `c`'s format, then mount it. */
+static void mount_candidate(unsigned int i, int heads_known, int heads)
+{
+    const struct disk_cand *c = &cands[i];
+    if (!heads_known) {
+        uint8_t got[64];
+        memset(got, 0, sizeof(got));
+        heads = (ufi_track_read(&c->f, 0, 1, D.cache, got, 3) == (int)c->f.nsec)
+                ? 2 : 1;
+    }
+    set_geometry(&c->f, c->cyls, (uint8_t)heads, c->sequential);
+    D.fmt_idx = (int)i;
+}
+
+/* Force a specific format (index into the candidate table) instead of auto-
+ * detecting. The head count is still probed so single-sided media is sized
+ * correctly. Returns 0 on success, <0 if the index is out of range. */
+int disk_mount_index(unsigned int idx)
+{
+    disk_unmount();
+    if (idx >= NR_CANDS)
+        return -1;
+    mount_candidate(idx, 0, 0);
     return 0;
 }
 
@@ -101,7 +132,7 @@ int disk_mount(void)
 {
     unsigned int i;
     disk_unmount();
-    for (i = 0; i < sizeof(cands)/sizeof(cands[0]); i++) {
+    for (i = 0; i < NR_CANDS; i++) {
         const struct ibm_fmt *f = &cands[i].f;
         uint8_t got[64];
         int heads;
@@ -113,7 +144,7 @@ int disk_mount(void)
         memset(got, 0, sizeof(got));
         heads = (ufi_track_read(f, 0, 1, D.cache, got, 3) == (int)f->nsec)
                 ? 2 : 1;
-        set_geometry(f, cands[i].cyls, (uint8_t)heads, cands[i].sequential);
+        mount_candidate(i, 1, heads);
         return 0;
     }
     return -1;
@@ -126,9 +157,16 @@ void disk_unmount(void)
     D.mounted = 0;
     D.cyl = D.head = -1;
     D.dirty = 0;
+    D.fmt_idx = -1;
 }
 
 int disk_is_mounted(void) { return D.mounted; }
+int disk_num_formats(void) { return (int)NR_CANDS; }
+int disk_format_index(void) { return D.mounted ? D.fmt_idx : -1; }
+const char *disk_format_name(unsigned int idx)
+{
+    return (idx < NR_CANDS) ? cands[idx].name : 0;
+}
 int disk_is_writeprotected(void) { return ufi_writeprotected(); }
 const struct ibm_fmt *disk_fmt(void) { return D.mounted ? &D.f : 0; }
 

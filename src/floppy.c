@@ -2220,6 +2220,42 @@ static void process_command(void)
         resp_sz = 8;
         goto out;
     }
+    case CMD_UFI_SET_FORMAT: {
+        /* Select the Mass-Storage disk format over the (composite) CDC channel
+         * without ejecting: force a built-in format, or re-auto-detect, then
+         * raise a UNIT ATTENTION so the host re-reads the new geometry. */
+        uint8_t sel;
+        uint32_t blocks;
+        const struct ibm_fmt *f;
+        if (len != 3)
+            goto bad_command;
+        sel = u_buf[2];
+        if ((bus_type != BUS_IBMPC) && (bus_type != BUS_SHUGART))
+            set_bus_type(BUS_IBMPC);
+        drive_select(0);
+        if (sel == 0xfe) {
+            /* query only: no change */
+        } else if (sel == 0xff) {
+            disk_mount();           /* re-auto-detect */
+            msc_media_changed();
+        } else {
+            disk_mount_index(sel);  /* force a specific built-in format */
+            msc_media_changed();
+        }
+        f = disk_fmt();
+        blocks = disk_blocks();
+        u_buf[0] = cmd;
+        u_buf[1] = ACK_OKAY;
+        u_buf[2] = disk_is_mounted() ? (uint8_t)disk_format_index() : 0xff;
+        u_buf[3] = (uint8_t)disk_num_formats();
+        u_buf[4] = f ? f->nsec : 0;
+        u_buf[5] = blocks & 0xff;
+        u_buf[6] = (blocks >> 8) & 0xff;
+        u_buf[7] = (blocks >> 16) & 0xff;
+        u_buf[8] = (blocks >> 24) & 0xff;
+        resp_sz = 9;
+        goto out;
+    }
     case CMD_UFI_WRITE_TRACK_TEST: {
         struct ibm_fmt f;
         int cyl, head, good, match;

@@ -42,6 +42,22 @@ own endpoints and is unaffected.
 The legacy single-function personalities are retained in the code (a build/run
 could default to CDC-only or Mass-Storage-only), but composite is the default.
 
+## Selecting the disk format
+
+Auto-detect picks the format from track 0, but you can override it over the live
+CDC channel **without ejecting** (composite mode). `CMD_UFI_SET_FORMAT` forces a
+built-in format (or re-runs auto-detect) and raises a SCSI UNIT ATTENTION so the
+host re-reads the new geometry. The `test/ufi_format.py` helper drives it:
+
+```
+ufi_format.py list      # list built-in formats and show the current one
+ufi_format.py auto      # re-run auto-detection
+ufi_format.py 2         # force a specific format by index (e.g. PC 720K)
+```
+
+When forcing a format the head count is still probed, so single-sided media is
+sized correctly.
+
 ## Formats (validated on real hardware)
 
 | Format                     | Encoding   | Read | Write |

@@ -126,6 +126,13 @@ static uint32_t xferred;      /* bytes transferred in the data phase so far */
 
 /* usb_mode / usb_mode_req / USB_MODE_* come from usb.h (via decls.h). */
 
+/* Raise a UNIT ATTENTION so the host re-reads the medium (e.g. after a control
+ * command has forced a different format / remounted). */
+void msc_media_changed(void)
+{
+    ua_pending = TRUE;
+}
+
 void msc_init(void)
 {
     st = ST_CBW;

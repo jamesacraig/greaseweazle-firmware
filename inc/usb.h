@@ -39,6 +39,8 @@ void msc_init(void);
 void msc_process(void);
 bool_t msc_set_configuration(void);
 bool_t msc_handle_class_request(void);
+/* Raise a SCSI UNIT ATTENTION (medium changed) for the next command. */
+void msc_media_changed(void);
 extern const uint8_t msc_device_descriptor[];
 extern const uint8_t msc_config_descriptor[];
 
