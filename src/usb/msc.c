@@ -100,11 +100,23 @@ static void set_sense(uint8_t k, uint8_t asc, uint8_t ascq)
 #define SENSE_MEDIUM_ERR()  set_sense(0x03, 0x11, 0x00) /* unrecovered read */
 #define SENSE_WRITE_ERR()   set_sense(0x03, 0x0c, 0x00) /* write fault */
 #define SENSE_UA_CHANGED()  set_sense(0x06, 0x28, 0x00) /* not-rdy->rdy, medium changed */
+#define SENSE_BECOMING_READY() set_sense(0x02, 0x04, 0x01) /* not ready, becoming ready */
 
 /* A UNIT ATTENTION condition (power-on or media change) is pending: the next
  * command other than INQUIRY / REQUEST SENSE is failed with CHECK CONDITION so
  * the host re-reads the (possibly new) medium's capacity. */
 static bool_t ua_pending;
+
+/* In composite mode the floppy drive is shared with the gw command path. While a
+ * gw flux command is in flight or holds the drive lease, Mass-Storage must not
+ * touch the drive (its seeks would corrupt a gw operation's head position).
+ * Rather than starve the host — which would time out and force a USB bus reset —
+ * we keep answering, reporting the unit as "becoming ready" so the host simply
+ * waits and retries until the gw operation releases the drive. */
+static int drive_unavailable(void)
+{
+    return floppy_busy() || floppy_drive_leased();
+}
 
 /* ---- State machine ---- */
 static enum {
@@ -293,13 +305,17 @@ static void scsi_dispatch(void)
      * STEP to probe for a newly inserted disk; passive readiness polls never
      * move the head, so an idle empty drive stays silent. */
     if (cb[0] != 0x12 && cb[0] != 0x03) {
-        int active = (cb[0] == 0x25 || cb[0] == 0x28 || cb[0] == 0x2a);
-        int chg = ufi_media_check(active);
-        if (chg) {
-            disk_unmount();
-            if (chg > 0)
-                disk_mount(); /* a disk is present: re-detect its format */
-            ua_pending = TRUE;
+        /* The media check pulses STEP to probe for new media, so only run it
+         * when the drive is ours (not leased to the gw command path). */
+        if (!drive_unavailable()) {
+            int active = (cb[0] == 0x25 || cb[0] == 0x28 || cb[0] == 0x2a);
+            int chg = ufi_media_check(active);
+            if (chg) {
+                disk_unmount();
+                if (chg > 0)
+                    disk_mount(); /* a disk is present: re-detect its format */
+                ua_pending = TRUE;
+            }
         }
         if (ua_pending) {
             SENSE_UA_CHANGED();
@@ -313,10 +329,15 @@ static void scsi_dispatch(void)
     switch (cb[0]) {
 
     case 0x00: /* TEST UNIT READY */
-        if (!disk_is_mounted() && ufi_media_present())
-            disk_mount();
-        if (disk_is_mounted()) { SENSE_OK(); csw.status = 0; }
-        else { SENSE_NOT_READY(); csw.status = 1; }
+        if (drive_unavailable()) {
+            /* gw owns the drive: report busy so the host waits, not resets. */
+            SENSE_BECOMING_READY(); csw.status = 1;
+        } else {
+            if (!disk_is_mounted() && ufi_media_present())
+                disk_mount();
+            if (disk_is_mounted()) { SENSE_OK(); csw.status = 0; }
+            else { SENSE_NOT_READY(); csw.status = 1; }
+        }
         st = ST_CSW;
         break;
 
@@ -358,12 +379,22 @@ static void scsi_dispatch(void)
         break;
 
     case 0x25: /* READ CAPACITY (10) */
-        if (!disk_is_mounted() && ufi_media_present()) disk_mount();
-        if (!disk_is_mounted()) { SENSE_NOT_READY(); csw.status = 1; finish_csw(); }
-        else scsi_read_capacity();
+        /* Capacity is cached once mounted, so it can answer even while the drive
+         * is leased; only a (drive-touching) fresh mount must wait. */
+        if (!disk_is_mounted() && ufi_media_present() && !drive_unavailable())
+            disk_mount();
+        if (disk_is_mounted()) scsi_read_capacity();
+        else if (drive_unavailable()) {
+            SENSE_BECOMING_READY(); csw.status = 1; finish_csw();
+        } else {
+            SENSE_NOT_READY(); csw.status = 1; finish_csw();
+        }
         break;
 
     case 0x28: /* READ (10) */
+        if (drive_unavailable()) {
+            SENSE_BECOMING_READY(); csw.status = 1; finish_csw(); break;
+        }
         if (!disk_is_mounted() && ufi_media_present()) disk_mount();
         io_lba = rd_be32(cb + 2);
         io_blocks = rd_be16(cb + 7);
@@ -380,6 +411,9 @@ static void scsi_dispatch(void)
         break;
 
     case 0x2a: /* WRITE (10) */
+        if (drive_unavailable()) {
+            SENSE_BECOMING_READY(); csw.status = 1; st = ST_CSW; break;
+        }
         io_lba = rd_be32(cb + 2);
         io_blocks = rd_be16(cb + 7);
         data_total = io_blocks * DISK_BLOCK_SIZE;
@@ -403,7 +437,8 @@ static void scsi_dispatch(void)
         break;
 
     case 0x35: /* SYNCHRONIZE CACHE */
-        disk_flush();
+        if (!drive_unavailable())
+            disk_flush();
         st = ST_CSW;
         break;
 
@@ -452,9 +487,16 @@ void msc_process(void)
         if (!ep_tx_ready(MSC_EP_IN))
             break;
         if (buf_off >= DISK_BLOCK_SIZE) {
-            /* Fetch the next block of a READ(10) stream. */
+            /* Fetch the next block of a READ(10) stream. If the gw command path
+             * grabbed the drive mid-read, terminate the data phase (ST_DATA_IN_
+             * FAIL sends a zero-length packet) and report busy so the host
+             * retries the whole read once the drive is free again. */
+            if (drive_unavailable()) {
+                SENSE_BECOMING_READY(); csw.status = 1; st = ST_DATA_IN_FAIL;
+                break;
+            }
             if (disk_read_block(io_lba, blkbuf) < 0) {
-                SENSE_MEDIUM_ERR(); csw.status = 1; finish_csw(); break;
+                SENSE_MEDIUM_ERR(); csw.status = 1; st = ST_DATA_IN_FAIL; break;
             }
             io_lba++; io_blocks--; buf_off = 0;
         }

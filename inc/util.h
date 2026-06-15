@@ -107,6 +107,9 @@ void floppy_process(void);
 /* TRUE while a gw flux command is mid-flight (not awaiting a new command). In
  * composite mode the MSC track I/O must stand off the drive until this clears. */
 int floppy_busy(void);
+/* TRUE while a recent gw command holds the shared drive (composite mode): MSC
+ * track I/O must not seek/spin the drive while this is set. */
+int floppy_drive_leased(void);
 
 /* Test mode */
 uint8_t testmode_init(void);

@@ -68,12 +68,14 @@ int main(void)
         }
 
         if (usb_mode == USB_MODE_COMPOSITE) {
-            /* Run both functions. The drive is shared cooperatively: hold off
-             * MSC track I/O while a gw flux command owns the drive (both drive
-             * the RDATA/WDATA timers), and let the WD177x-style idle check spin
-             * the motor down when neither is using it. */
+            /* Run both functions every iteration. They share the drive: while a
+             * gw flux command is mid-flight or holds the drive lease, msc_process
+             * keeps answering the host but defers track I/O (reporting "becoming
+             * ready"), so the host waits and retries rather than timing out and
+             * resetting the bus. The WD177x-style idle check spins the motor down
+             * once neither side is using the drive. */
             floppy_process();
-            if (!floppy_busy())
+            if (!floppy_busy()) /* don't perturb a timing-critical flux capture */
                 msc_process();
             ufi_motor_idle_check();
         } else if (usb_mode == USB_MODE_MSC) {

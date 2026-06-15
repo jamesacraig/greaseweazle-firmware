@@ -1729,6 +1729,14 @@ static time_t ufi_last_access;
 #define UFI_IDLE_REVS    10
 #define UFI_REV_MS       200 /* 300 RPM */
 
+/* Composite-mode drive lease: while a gw command that drives the head/motor has
+ * run recently, Mass-Storage track I/O must not touch the drive — otherwise its
+ * seeks move the head out from under a multi-command gw flux operation (e.g. the
+ * host's per-cylinder seek+erase). The lease is refreshed by such commands and
+ * covers the host's inter-command gaps (incl. motor spin-up waits). */
+static time_t gw_drive_lease;
+#define GW_DRIVE_LEASE_MS 1500
+
 static void ufi_motor_run(void)
 {
     drive_select(0); /* re-assert SELECT (no-op if already selected) */
@@ -1744,10 +1752,16 @@ static void ufi_motor_run(void)
     ufi_last_access = time_now();
 }
 
-/* Called from the main loop while in Mass-Storage mode: once the drive has been
- * idle for ~10 revolutions, stop the motor and deselect the drive. */
+/* Called from the main loop while Mass-Storage is active: once the drive has
+ * been idle for ~10 revolutions, stop the motor and deselect the drive. In
+ * composite mode the drive is shared with the gw command path, so never spin
+ * down while a gw flux command owns the drive (a long erase/read/write would
+ * otherwise lose its spindle mid-operation). gw commands also refresh
+ * ufi_last_access (see process_command) so discrete commands keep it alive. */
 void ufi_motor_idle_check(void)
 {
+    if (floppy_busy())
+        return;
     if ((unit[0].motor || (unit_nr == 0))
         && (time_since(ufi_last_access) >= time_ms(UFI_IDLE_REVS * UFI_REV_MS))) {
         drive_motor(0, FALSE);
@@ -1933,6 +1947,25 @@ static void process_command(void)
 
     watchdog_arm();
     act_led(TRUE);
+
+    /* A gw command is drive activity too: refresh the Mass-Storage idle timer so
+     * its motor spindown (composite mode) doesn't cut power between back-to-back
+     * gw commands such as CMD_MOTOR followed by CMD_ERASE_FLUX. */
+    ufi_last_access = time_now();
+
+    /* Commands that drive the head/motor lease the drive away from Mass-Storage
+     * (composite mode) so background disk I/O cannot move the head out from
+     * under a multi-command gw flux operation. */
+    switch (cmd) {
+    case CMD_SEEK: case CMD_HEAD: case CMD_MOTOR:
+    case CMD_SELECT: case CMD_DESELECT: case CMD_NOCLICK_STEP:
+    case CMD_READ_FLUX: case CMD_WRITE_FLUX: case CMD_ERASE_FLUX:
+    case CMD_UFI_READ_TRACK: case CMD_UFI_WRITE_TRACK_TEST:
+        gw_drive_lease = time_now();
+        break;
+    default:
+        break;
+    }
 
     switch (cmd) {
     case CMD_GET_INFO: {
@@ -2342,6 +2375,11 @@ static void floppy_configure(void)
 int floppy_busy(void)
 {
     return floppy_state != ST_command_wait;
+}
+
+int floppy_drive_leased(void)
+{
+    return time_since(gw_drive_lease) < time_ms(GW_DRIVE_LEASE_MS);
 }
 
 void floppy_process(void)
