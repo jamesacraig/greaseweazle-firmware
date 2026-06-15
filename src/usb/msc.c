@@ -329,14 +329,17 @@ static void scsi_dispatch(void)
     switch (cb[0]) {
 
     case 0x00: /* TEST UNIT READY */
+        /* Don't probe/mount here: mounting happens at power-on and on a detected
+         * media change. Re-attempting a (motor-spinning, auto-detecting) mount on
+         * every poll would keep the spindle running forever on a present but
+         * unmountable disk (e.g. blank/unformatted). */
         if (drive_unavailable()) {
             /* gw owns the drive: report busy so the host waits, not resets. */
             SENSE_BECOMING_READY(); csw.status = 1;
+        } else if (disk_is_mounted()) {
+            SENSE_OK(); csw.status = 0;
         } else {
-            if (!disk_is_mounted() && ufi_media_present())
-                disk_mount();
-            if (disk_is_mounted()) { SENSE_OK(); csw.status = 0; }
-            else { SENSE_NOT_READY(); csw.status = 1; }
+            SENSE_NOT_READY(); csw.status = 1;
         }
         st = ST_CSW;
         break;
@@ -379,10 +382,8 @@ static void scsi_dispatch(void)
         break;
 
     case 0x25: /* READ CAPACITY (10) */
-        /* Capacity is cached once mounted, so it can answer even while the drive
-         * is leased; only a (drive-touching) fresh mount must wait. */
-        if (!disk_is_mounted() && ufi_media_present() && !drive_unavailable())
-            disk_mount();
+        /* Capacity is cached once mounted; answer from it (even while leased).
+         * Mounting is handled at power-on / media change, not here. */
         if (disk_is_mounted()) scsi_read_capacity();
         else if (drive_unavailable()) {
             SENSE_BECOMING_READY(); csw.status = 1; finish_csw();
@@ -395,7 +396,6 @@ static void scsi_dispatch(void)
         if (drive_unavailable()) {
             SENSE_BECOMING_READY(); csw.status = 1; finish_csw(); break;
         }
-        if (!disk_is_mounted() && ufi_media_present()) disk_mount();
         io_lba = rd_be32(cb + 2);
         io_blocks = rd_be16(cb + 7);
         data_total = io_blocks * DISK_BLOCK_SIZE;
@@ -419,7 +419,6 @@ static void scsi_dispatch(void)
         data_total = io_blocks * DISK_BLOCK_SIZE;
         if (data_total > cbw.len) data_total = cbw.len;
         buf_off = 0;
-        if (!disk_is_mounted() && ufi_media_present()) disk_mount();
         if (!disk_is_mounted()) {
             SENSE_NOT_READY(); csw.status = 1; st = ST_CSW;
         } else if (disk_is_writeprotected()) {

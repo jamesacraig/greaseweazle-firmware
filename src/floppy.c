@@ -1948,20 +1948,19 @@ static void process_command(void)
     watchdog_arm();
     act_led(TRUE);
 
-    /* A gw command is drive activity too: refresh the Mass-Storage idle timer so
-     * its motor spindown (composite mode) doesn't cut power between back-to-back
-     * gw commands such as CMD_MOTOR followed by CMD_ERASE_FLUX. */
-    ufi_last_access = time_now();
-
     /* Commands that drive the head/motor lease the drive away from Mass-Storage
      * (composite mode) so background disk I/O cannot move the head out from
-     * under a multi-command gw flux operation. */
+     * under a multi-command gw flux operation, and refresh the idle timer so the
+     * spindle isn't cut between back-to-back gw commands (e.g. CMD_MOTOR then
+     * CMD_ERASE_FLUX). Non-drive commands (GET_INFO, host-port probes, ...) must
+     * NOT keep the motor alive. */
     switch (cmd) {
     case CMD_SEEK: case CMD_HEAD: case CMD_MOTOR:
     case CMD_SELECT: case CMD_DESELECT: case CMD_NOCLICK_STEP:
     case CMD_READ_FLUX: case CMD_WRITE_FLUX: case CMD_ERASE_FLUX:
     case CMD_UFI_READ_TRACK: case CMD_UFI_WRITE_TRACK_TEST:
         gw_drive_lease = time_now();
+        ufi_last_access = time_now();
         break;
     default:
         break;
