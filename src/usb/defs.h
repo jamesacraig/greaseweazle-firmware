@@ -31,7 +31,6 @@
 #define DESC_DEVICE_QUALIFIER 6
 #define DESC_OTHER_SPEED_CONFIGURATION 7
 #define DESC_INTERFACE_POWER 8
-#define DESC_INTERFACE_ASSOCIATION 0x0b
 #define DESC_CS_INTERFACE   0x24
 
 #define USB_CLASS_CDC_DATA 0x0a
@@ -50,8 +49,6 @@ extern const uint8_t device_descriptor[];
 extern const uint8_t device_qualifier[];
 extern const uint8_t config_fs_descriptor[];
 extern const uint8_t config_hs_descriptor[];
-extern const uint8_t composite_device_descriptor[];
-extern const uint8_t composite_config_descriptor[];
 
 #define NR_STRING_DESC 4
 extern char * const string_descriptors[];

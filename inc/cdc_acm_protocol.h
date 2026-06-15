@@ -96,14 +96,7 @@
 /* CMD_UFI_MOUNT_TEST, length=2. [debug] Run the disk-layer auto-detect in CDC
  * mode. Returns 6 bytes after ACK: u8 mounted, u8 nsec, u32 block_count(LE). */
 #define CMD_UFI_MOUNT_TEST 26
-/* CMD_UFI_SET_FORMAT, length=3, selector. Select the Mass-Storage disk format
- * without ejecting (composite mode). selector: 0xFF = re-auto-detect, 0xFE =
- * query only (no change), else force built-in format index `selector`. Raises a
- * SCSI UNIT ATTENTION so the host re-reads the new geometry. Returns 7 bytes
- * after ACK: u8 mounted_index(0xFF=none), u8 num_formats, u8 nsec,
- * u32 block_count(LE). */
-#define CMD_UFI_SET_FORMAT 27
-#define CMD_MAX            27
+#define CMD_MAX            26
 
 
 /*

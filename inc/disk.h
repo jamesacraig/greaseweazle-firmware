@@ -39,16 +39,10 @@ void disk_init(uint8_t *cache_buf);
 int disk_mount(void);
 /* Force a specific geometry instead of auto-detecting (override). */
 int disk_mount_forced(const struct ibm_fmt *f, uint16_t cyls, uint8_t heads);
-/* Force a specific built-in format by index (head count is still probed). */
-int disk_mount_index(unsigned int idx);
 /* Flush and forget the current medium (e.g. on eject / mode exit). */
 void disk_unmount(void);
 
 int disk_is_mounted(void);
-/* Built-in format table introspection (for the format-select control command). */
-int disk_num_formats(void);
-int disk_format_index(void);              /* mounted format index, -1 if none */
-const char *disk_format_name(unsigned int idx);
 int disk_is_writeprotected(void);
 uint32_t disk_blocks(void);            /* number of 512-byte logical blocks */
 const struct ibm_fmt *disk_fmt(void);

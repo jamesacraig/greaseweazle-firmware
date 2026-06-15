@@ -634,11 +634,10 @@ static uint8_t get_floppy_pin(unsigned int pin, uint8_t *p_level)
 
 static void floppy_reset(void)
 {
-    /* Whenever Mass-Storage is active (standalone MSC or composite) the mounted
-     * drive must stay selected and spinning across USB bus resets (which occur
-     * during enumeration); quiescing here would deselect it and break the next
-     * SCSI read/write. */
-    if (usb_mode != USB_MODE_CDC)
+    /* In Mass-Storage mode the mounted drive must stay selected and spinning
+     * across USB bus resets (which occur during enumeration); quiescing here
+     * would deselect it and break the next SCSI read/write. */
+    if (usb_mode == USB_MODE_MSC)
         return;
     floppy_state = ST_inactive;
     quiesce_drives();
@@ -1729,14 +1728,6 @@ static time_t ufi_last_access;
 #define UFI_IDLE_REVS    10
 #define UFI_REV_MS       200 /* 300 RPM */
 
-/* Composite-mode drive lease: while a gw command that drives the head/motor has
- * run recently, Mass-Storage track I/O must not touch the drive — otherwise its
- * seeks move the head out from under a multi-command gw flux operation (e.g. the
- * host's per-cylinder seek+erase). The lease is refreshed by such commands and
- * covers the host's inter-command gaps (incl. motor spin-up waits). */
-static time_t gw_drive_lease;
-#define GW_DRIVE_LEASE_MS 1500
-
 static void ufi_motor_run(void)
 {
     drive_select(0); /* re-assert SELECT (no-op if already selected) */
@@ -1752,16 +1743,10 @@ static void ufi_motor_run(void)
     ufi_last_access = time_now();
 }
 
-/* Called from the main loop while Mass-Storage is active: once the drive has
- * been idle for ~10 revolutions, stop the motor and deselect the drive. In
- * composite mode the drive is shared with the gw command path, so never spin
- * down while a gw flux command owns the drive (a long erase/read/write would
- * otherwise lose its spindle mid-operation). gw commands also refresh
- * ufi_last_access (see process_command) so discrete commands keep it alive. */
+/* Called from the main loop while in Mass-Storage mode: once the drive has been
+ * idle for ~10 revolutions, stop the motor and deselect the drive. */
 void ufi_motor_idle_check(void)
 {
-    if (floppy_busy())
-        return;
     if ((unit[0].motor || (unit_nr == 0))
         && (time_since(ufi_last_access) >= time_ms(UFI_IDLE_REVS * UFI_REV_MS))) {
         drive_motor(0, FALSE);
@@ -1947,24 +1932,6 @@ static void process_command(void)
 
     watchdog_arm();
     act_led(TRUE);
-
-    /* Commands that drive the head/motor lease the drive away from Mass-Storage
-     * (composite mode) so background disk I/O cannot move the head out from
-     * under a multi-command gw flux operation, and refresh the idle timer so the
-     * spindle isn't cut between back-to-back gw commands (e.g. CMD_MOTOR then
-     * CMD_ERASE_FLUX). Non-drive commands (GET_INFO, host-port probes, ...) must
-     * NOT keep the motor alive. */
-    switch (cmd) {
-    case CMD_SEEK: case CMD_HEAD: case CMD_MOTOR:
-    case CMD_SELECT: case CMD_DESELECT: case CMD_NOCLICK_STEP:
-    case CMD_READ_FLUX: case CMD_WRITE_FLUX: case CMD_ERASE_FLUX:
-    case CMD_UFI_READ_TRACK: case CMD_UFI_WRITE_TRACK_TEST:
-        gw_drive_lease = time_now();
-        ufi_last_access = time_now();
-        break;
-    default:
-        break;
-    }
 
     switch (cmd) {
     case CMD_GET_INFO: {
@@ -2252,42 +2219,6 @@ static void process_command(void)
         resp_sz = 8;
         goto out;
     }
-    case CMD_UFI_SET_FORMAT: {
-        /* Select the Mass-Storage disk format over the (composite) CDC channel
-         * without ejecting: force a built-in format, or re-auto-detect, then
-         * raise a UNIT ATTENTION so the host re-reads the new geometry. */
-        uint8_t sel;
-        uint32_t blocks;
-        const struct ibm_fmt *f;
-        if (len != 3)
-            goto bad_command;
-        sel = u_buf[2];
-        if ((bus_type != BUS_IBMPC) && (bus_type != BUS_SHUGART))
-            set_bus_type(BUS_IBMPC);
-        drive_select(0);
-        if (sel == 0xfe) {
-            /* query only: no change */
-        } else if (sel == 0xff) {
-            disk_mount();           /* re-auto-detect */
-            msc_media_changed();
-        } else {
-            disk_mount_index(sel);  /* force a specific built-in format */
-            msc_media_changed();
-        }
-        f = disk_fmt();
-        blocks = disk_blocks();
-        u_buf[0] = cmd;
-        u_buf[1] = ACK_OKAY;
-        u_buf[2] = disk_is_mounted() ? (uint8_t)disk_format_index() : 0xff;
-        u_buf[3] = (uint8_t)disk_num_formats();
-        u_buf[4] = f ? f->nsec : 0;
-        u_buf[5] = blocks & 0xff;
-        u_buf[6] = (blocks >> 8) & 0xff;
-        u_buf[7] = (blocks >> 16) & 0xff;
-        u_buf[8] = (blocks >> 24) & 0xff;
-        resp_sz = 9;
-        goto out;
-    }
     case CMD_UFI_WRITE_TRACK_TEST: {
         struct ibm_fmt f;
         int cyl, head, good, match;
@@ -2371,26 +2302,11 @@ static void floppy_configure(void)
     act_led(FALSE);
 }
 
-int floppy_busy(void)
-{
-    return floppy_state != ST_command_wait;
-}
-
-int floppy_drive_leased(void)
-{
-    return time_since(gw_drive_lease) < time_ms(GW_DRIVE_LEASE_MS);
-}
-
 void floppy_process(void)
 {
     int len;
 
-    /* The watchdog quiesces the drive after a stalled gw flux command. In
-     * composite mode the drive is shared with Mass-Storage, which manages the
-     * motor itself (ufi_motor_idle_check); letting the watchdog deselect it
-     * would disrupt the mounted disk, so suppress it there. */
-    if ((usb_mode != USB_MODE_COMPOSITE)
-        && watchdog.armed && (time_since(watchdog.deadline) >= 0)) {
+    if (watchdog.armed && (time_since(watchdog.deadline) >= 0)) {
         floppy_configure();
         quiesce_drives();
     }
