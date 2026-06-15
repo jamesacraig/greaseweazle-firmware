@@ -51,6 +51,22 @@ Modelled on the WD177x controllers: on access the drive is selected and the
 spindle spun up (waiting ~6 revolutions to stabilise); after ~10 idle revolutions
 the motor is stopped and the drive deselected.
 
+## Media change
+
+Disk insertion/removal is reported to the host as a SCSI UNIT ATTENTION (sense
+`06/28/00`), so the OS re-reads the new medium's geometry — swapping disks works
+without a replug. Detection uses the drive's latched, active-low DISK CHANGE
+line (pin 34), which is only valid while the drive is selected:
+
+- **Removal** is detected passively — pulling the disk asserts the latch, read
+  on the next command; the device then reports *not ready* (`02/3a/00`).
+- **Insertion** needs a STEP pulse to clear the latch, so — like a real floppy,
+  which is inert until the OS touches it — the head only steps to look for new
+  media when the host **actively accesses** the drive (READ CAPACITY / READ /
+  WRITE), never on a passive readiness poll. An idle empty drive is silent.
+- With **no disk at power-on** the device enumerates immediately as an empty
+  removable drive (it does not block waiting for a disk).
+
 ## Build & flash
 
 ```

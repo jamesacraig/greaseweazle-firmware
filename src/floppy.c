@@ -1755,6 +1755,115 @@ void ufi_motor_idle_check(void)
 }
 
 /*
+ * Media-change detection via the DISK CHANGE line (pin 34, gpiob15 on V4.1).
+ * Characterised on the attached drive: a latched, active-LOW DSKCHG that is
+ * valid only while the drive is selected. It reads LOW (0) when the disk has
+ * been removed/changed (or is absent) and clears to HIGH (1) only after a STEP
+ * pulse with a disk present. So HIGH => a disk is seated and unchanged since
+ * the last step; LOW => removed / swapped / absent (latched until a step + disk).
+ *
+ * Removal needs no head movement: a seated disk holds the line HIGH, and pulling
+ * it asserts the latch LOW, which we read passively. Detecting a (re)insertion
+ * *does* need a STEP to clear the latch, so — like a real floppy, which is inert
+ * until the OS accesses it — we only probe when the host is actively accessing
+ * the medium (READ CAPACITY / READ / WRITE), never on a passive readiness poll.
+ * An idle drive with no disk therefore stays silent.
+ */
+static bool_t ufi_media_seated;        /* our belief: a disk is present */
+static time_t ufi_probe_block_until;   /* suppress insertion-probe until this time */
+#define UFI_PROBE_COOLDOWN_MS 3000
+
+/* Read the DISK CHANGE line. Returns 1 (HIGH), 0 (LOW), or -1 if the board does
+ * not expose the pin (media-change then stays disabled). The drive must already
+ * be selected; allow the line to settle after a fresh select. */
+static int ufi_dskchg(void)
+{
+    uint8_t lvl = LOW;
+    delay_us(20);
+    if (get_floppy_pin(34, &lvl) != ACK_OKAY)
+        return -1;
+    return (lvl == HIGH) ? 1 : 0;
+}
+
+/* Pulse STEP without (net) moving the head, to clear a latched DISK CHANGE.
+ * Uses floppy_seek so the cylinder bookkeeping stays correct. */
+static void ufi_step_pulse(void)
+{
+    int c = unit[0].cyl;
+    int other = (c <= 0) ? 1 : (c - 1);
+    floppy_seek(other);
+    floppy_seek(c);
+}
+
+/* Sample the DISK CHANGE line and reset the media-present baseline. Call once
+ * after the initial mount (drive already selected). */
+void ufi_media_reset(void)
+{
+    int dsk;
+    drive_select(0);
+    dsk = ufi_dskchg();
+    /* If DISK CHANGE is unavailable (non-V4 board) assume a disk is present so
+     * the lazy mount path still runs (matches pre-media-change behaviour). */
+    ufi_media_seated = (dsk != 0);
+}
+
+/* Whether a disk is believed to be physically present (per the DISK CHANGE
+ * line). Used to avoid a doomed mount attempt — which spins the motor and waits
+ * out the no-index timeout — when the drive is empty. */
+int ufi_media_present(void)
+{
+    return ufi_media_seated;
+}
+
+/* Poll for a media change. Returns +1 if a disk was (re)inserted, -1 if it was
+ * removed, 0 if unchanged. `may_probe` permits a STEP to test for a newly
+ * inserted disk (set only for active accesses, so an idle drive never chatters).
+ * Selects the drive (restoring the prior select state) and never spins the
+ * motor. */
+int ufi_media_check(int may_probe)
+{
+    bool_t was_selected = (unit_nr == 0);
+    bool_t seated_before = ufi_media_seated;
+    int dsk, result = 0;
+
+    drive_select(0);
+    dsk = ufi_dskchg();
+    if (dsk < 0) {                     /* DISK CHANGE unavailable: detect off */
+        if (!was_selected)
+            drive_deselect();
+        return 0;
+    }
+
+    if (dsk) {
+        /* Line HIGH: a disk is seated, unchanged since the last step. */
+        ufi_media_seated = TRUE;
+    } else if (seated_before) {
+        /* Line asserted while we believed a disk seated: it was removed. No
+         * step needed — the latch reads LOW on its own. Hold off insertion-
+         * probing for a cooldown so the host's removal-revalidation burst
+         * (READ CAPACITY / partition-table READ) does not immediately rattle
+         * the head chasing a disk that was just taken out. */
+        ufi_media_seated = FALSE;
+        ufi_probe_block_until = time_now() + time_ms(UFI_PROBE_COOLDOWN_MS);
+    } else if (may_probe && (time_since(ufi_probe_block_until) >= 0)) {
+        /* Believed empty and the host is actively accessing: pulse STEP to
+         * clear the latch and see whether a disk has since been inserted. Rate-
+         * limited (a burst of active commands collapses to a single step), so a
+         * stray read never produces more than one step per cooldown. */
+        ufi_step_pulse();
+        ufi_media_seated = (ufi_dskchg() == 1);
+        ufi_probe_block_until = time_now() + time_ms(UFI_PROBE_COOLDOWN_MS);
+    }
+    /* else: believed empty (passive poll, or within cooldown) -> stay silent. */
+
+    if (ufi_media_seated != seated_before)
+        result = ufi_media_seated ? 1 : -1;
+    if (!was_selected)
+        drive_deselect();
+    return result;
+}
+
+/*
  * Disk/block-layer backend hooks (declared in disk.h). The block cache lives
  * in UFI_IMG; verify-after-write reads back into UFI_IMG2; both use UFI_SCRATCH.
  */
@@ -1790,11 +1899,19 @@ void ufi_enter_msc(void)
     set_bus_type(BUS_IBMPC);
     drive_select(0);
     disk_init(UFI_IMG);
+    /* Pulse STEP once to clear any latched DISK CHANGE so the line reads true
+     * (recalibrates on the first seek; uses the TRK0 sensor, no disk needed). */
+    ufi_step_pulse();
     /* Identify the medium now, while the host is still disconnected, so the
      * first READ CAPACITY / TEST UNIT READY answers instantly (no probe stall
-     * racing the kernel's command timeout). The motor is started on demand by
-     * the track-I/O hooks (ufi_motor_run) and stops after an idle period. */
-    disk_mount();
+     * racing the kernel's command timeout). Skip the probe when no disk is
+     * present: a doomed mount would spin the motor and block here for seconds
+     * waiting for index pulses that never come — long enough to stall USB
+     * enumeration. The motor is started on demand by the track-I/O hooks
+     * (ufi_motor_run) and stops after an idle period. */
+    if (ufi_dskchg() == 1)
+        disk_mount();
+    ufi_media_reset(); /* baseline the DISK CHANGE line for media-change polling */
     msc_init();
     watchdog.armed = FALSE; /* we manage the drive ourselves while mounted */
 }

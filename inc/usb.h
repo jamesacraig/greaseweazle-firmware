@@ -44,6 +44,13 @@ void ufi_enter_msc(void);
 void ufi_exit_msc(void);
 /* Spin the drive motor down after an idle period (call from the main loop). */
 void ufi_motor_idle_check(void);
+/* Media-change detection via the DISK CHANGE line. ufi_media_reset() samples a
+ * baseline after the initial mount; ufi_media_check() polls and returns
+ * +1 if a disk was (re)inserted, -1 if removed, 0 if unchanged. */
+void ufi_media_reset(void);
+int ufi_media_check(int may_probe);
+/* Whether a disk is believed physically present (DISK CHANGE line). */
+int ufi_media_present(void);
 
 /* USB Endpoints for CDC ACM communications. */
 #define EP_RX 2

@@ -97,13 +97,20 @@ static void set_sense(uint8_t k, uint8_t asc, uint8_t ascq)
 #define SENSE_ILLEGAL_REQ() set_sense(0x05, 0x20, 0x00) /* invalid command */
 #define SENSE_MEDIUM_ERR()  set_sense(0x03, 0x11, 0x00) /* unrecovered read */
 #define SENSE_WRITE_ERR()   set_sense(0x03, 0x0c, 0x00) /* write fault */
+#define SENSE_UA_CHANGED()  set_sense(0x06, 0x28, 0x00) /* not-rdy->rdy, medium changed */
+
+/* A UNIT ATTENTION condition (power-on or media change) is pending: the next
+ * command other than INQUIRY / REQUEST SENSE is failed with CHECK CONDITION so
+ * the host re-reads the (possibly new) medium's capacity. */
+static bool_t ua_pending;
 
 /* ---- State machine ---- */
 static enum {
-    ST_CBW,        /* await a Command Block Wrapper */
-    ST_DATA_IN,    /* sending data to host */
-    ST_DATA_OUT,   /* receiving data from host */
-    ST_CSW,        /* send Command Status Wrapper */
+    ST_CBW,         /* await a Command Block Wrapper */
+    ST_DATA_IN,     /* sending data to host */
+    ST_DATA_OUT,    /* receiving data from host */
+    ST_DATA_IN_FAIL,/* terminate a failed data-in phase with a zero-length pkt */
+    ST_CSW,         /* send Command Status Wrapper */
 } st;
 
 static struct cbw cbw;
@@ -121,6 +128,7 @@ void msc_init(void)
 {
     st = ST_CBW;
     SENSE_OK();
+    ua_pending = TRUE; /* power-on UNIT ATTENTION: host should read capacity */
     /* The medium is identified lazily on the first TEST UNIT READY / READ
      * CAPACITY so USB enumeration is not delayed by the format probe. */
 }
@@ -247,6 +255,21 @@ static void scsi_mode_sense10(void)
 
 /* Returns 1 if the command was fully handled here (status set), 0 if it set up
  * a data phase that the state machine must drive. */
+/* Finish the current command. A data-in command that fails before sending any
+ * data (UNIT ATTENTION, NOT READY, ...) must still terminate the data phase
+ * with a zero-length packet, or the host waits for the data it requested and
+ * times out before reading the status. Commands with no inbound data, or that
+ * already streamed some (whose trailing short packet ends the phase), go
+ * straight to the CSW. */
+static void finish_csw(void)
+{
+    if ((cbw.flags & 0x80) && (cbw.len != 0) && (xferred == 0)
+        && (csw.status != 0))
+        st = ST_DATA_IN_FAIL;
+    else
+        st = ST_CSW;
+}
+
 static void scsi_dispatch(void)
 {
     const uint8_t *cb = cbw.cb;
@@ -254,10 +277,34 @@ static void scsi_dispatch(void)
     csw.status = 0;
     xferred = 0;
 
+    /* Detect medium insertion/removal and surface it as UNIT ATTENTION. Skip
+     * the INQUIRY / REQUEST SENSE handshake (the host uses those to identify
+     * the device and to drain a pending sense, so they must always proceed).
+     * Only the active-access commands (READ CAPACITY / READ / WRITE) may pulse
+     * STEP to probe for a newly inserted disk; passive readiness polls never
+     * move the head, so an idle empty drive stays silent. */
+    if (cb[0] != 0x12 && cb[0] != 0x03) {
+        int active = (cb[0] == 0x25 || cb[0] == 0x28 || cb[0] == 0x2a);
+        int chg = ufi_media_check(active);
+        if (chg) {
+            disk_unmount();
+            if (chg > 0)
+                disk_mount(); /* a disk is present: re-detect its format */
+            ua_pending = TRUE;
+        }
+        if (ua_pending) {
+            SENSE_UA_CHANGED();
+            csw.status = 1;
+            ua_pending = FALSE;
+            finish_csw();
+            return;
+        }
+    }
+
     switch (cb[0]) {
 
     case 0x00: /* TEST UNIT READY */
-        if (!disk_is_mounted())
+        if (!disk_is_mounted() && ufi_media_present())
             disk_mount();
         if (disk_is_mounted()) { SENSE_OK(); csw.status = 0; }
         else { SENSE_NOT_READY(); csw.status = 1; }
@@ -298,20 +345,20 @@ static void scsi_dispatch(void)
         break;
 
     case 0x25: /* READ CAPACITY (10) */
-        if (!disk_is_mounted()) disk_mount();
-        if (!disk_is_mounted()) { SENSE_NOT_READY(); csw.status = 1; st = ST_CSW; }
+        if (!disk_is_mounted() && ufi_media_present()) disk_mount();
+        if (!disk_is_mounted()) { SENSE_NOT_READY(); csw.status = 1; finish_csw(); }
         else scsi_read_capacity();
         break;
 
     case 0x28: /* READ (10) */
-        if (!disk_is_mounted()) disk_mount();
+        if (!disk_is_mounted() && ufi_media_present()) disk_mount();
         io_lba = rd_be32(cb + 2);
         io_blocks = rd_be16(cb + 7);
         data_total = io_blocks * DISK_BLOCK_SIZE;
         if (data_total > cbw.len) data_total = cbw.len;
         buf_off = DISK_BLOCK_SIZE; /* force a fetch on first DATA_IN step */
         if (!disk_is_mounted()) {
-            SENSE_NOT_READY(); csw.status = 1; st = ST_CSW;
+            SENSE_NOT_READY(); csw.status = 1; finish_csw();
         } else if (data_total == 0) {
             st = ST_CSW;
         } else {
@@ -325,7 +372,7 @@ static void scsi_dispatch(void)
         data_total = io_blocks * DISK_BLOCK_SIZE;
         if (data_total > cbw.len) data_total = cbw.len;
         buf_off = 0;
-        if (!disk_is_mounted()) disk_mount();
+        if (!disk_is_mounted() && ufi_media_present()) disk_mount();
         if (!disk_is_mounted()) {
             SENSE_NOT_READY(); csw.status = 1; st = ST_CSW;
         } else if (disk_is_writeprotected()) {
@@ -394,7 +441,7 @@ void msc_process(void)
         if (buf_off >= DISK_BLOCK_SIZE) {
             /* Fetch the next block of a READ(10) stream. */
             if (disk_read_block(io_lba, blkbuf) < 0) {
-                SENSE_MEDIUM_ERR(); csw.status = 1; st = ST_CSW; break;
+                SENSE_MEDIUM_ERR(); csw.status = 1; finish_csw(); break;
             }
             io_lba++; io_blocks--; buf_off = 0;
         }
@@ -428,6 +475,14 @@ void msc_process(void)
             disk_flush();
             st = ST_CSW;
         }
+        break;
+
+    case ST_DATA_IN_FAIL:
+        /* End a failed data-in phase with a zero-length packet, then status. */
+        if (!ep_tx_ready(MSC_EP_IN))
+            break;
+        usb_write(MSC_EP_IN, blkbuf, 0);
+        st = ST_CSW;
         break;
 
     case ST_CSW:
