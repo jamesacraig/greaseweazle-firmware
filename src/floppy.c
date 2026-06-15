@@ -634,10 +634,11 @@ static uint8_t get_floppy_pin(unsigned int pin, uint8_t *p_level)
 
 static void floppy_reset(void)
 {
-    /* In Mass-Storage mode the mounted drive must stay selected and spinning
-     * across USB bus resets (which occur during enumeration); quiescing here
-     * would deselect it and break the next SCSI read/write. */
-    if (usb_mode == USB_MODE_MSC)
+    /* Whenever Mass-Storage is active (standalone MSC or composite) the mounted
+     * drive must stay selected and spinning across USB bus resets (which occur
+     * during enumeration); quiescing here would deselect it and break the next
+     * SCSI read/write. */
+    if (usb_mode != USB_MODE_CDC)
         return;
     floppy_state = ST_inactive;
     quiesce_drives();
@@ -2302,11 +2303,21 @@ static void floppy_configure(void)
     act_led(FALSE);
 }
 
+int floppy_busy(void)
+{
+    return floppy_state != ST_command_wait;
+}
+
 void floppy_process(void)
 {
     int len;
 
-    if (watchdog.armed && (time_since(watchdog.deadline) >= 0)) {
+    /* The watchdog quiesces the drive after a stalled gw flux command. In
+     * composite mode the drive is shared with Mass-Storage, which manages the
+     * motor itself (ufi_motor_idle_check); letting the watchdog deselect it
+     * would disrupt the mounted disk, so suppress it there. */
+    if ((usb_mode != USB_MODE_COMPOSITE)
+        && watchdog.armed && (time_since(watchdog.deadline) >= 0)) {
         floppy_configure();
         quiesce_drives();
     }

@@ -101,10 +101,17 @@ bool_t cdc_acm_set_configuration(void)
     uint8_t bulk_type = EPT_DBLBUF;
 
 #ifdef BOOTLOADER
-    /* We don't bother with the complicated double-buffered endpoints. The 
+    /* We don't bother with the complicated double-buffered endpoints. The
      * regular bulk endpoints are fast enough and possibly more reliable. */
     bulk_type = EPT_BULK;
 #endif
+
+    /* Composite mode also shares the packet-buffer memory with the MSC bulk
+     * pair, so use single-buffered CDC bulk endpoints to stay within the PMA
+     * budget (the disk uses its own dedicated endpoints; the serial channel is
+     * used for control/commands, not sustained flux streaming). */
+    if (usb_mode == USB_MODE_COMPOSITE)
+        bulk_type = EPT_BULK;
 
     gw_info.usb_speed = usb_is_highspeed() ? 1 : 0;
 

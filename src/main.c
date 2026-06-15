@@ -42,9 +42,10 @@ int main(void)
 
     floppy_init();
 
-    /* Set up the default personality before enumerating. Defaulting to
-     * Mass-Storage makes the device bootable as a disk. */
-    if (usb_mode == USB_MODE_MSC)
+    /* Set up the default personality before enumerating. The default is
+     * COMPOSITE (CDC serial + Mass-Storage disk together); both need the drive
+     * set up and the disk identified up front, as for standalone MSC. */
+    if (usb_mode != USB_MODE_CDC)
         ufi_enter_msc();
     usb_init();
 
@@ -53,8 +54,9 @@ int main(void)
 
         usb_process();
 
-        /* Apply a requested personality switch (CDC <-> Mass-Storage) by
-         * re-initialising USB so the host re-enumerates the new device. */
+        /* Apply a requested personality switch (legacy CDC <-> Mass-Storage) by
+         * re-initialising USB so the host re-enumerates. COMPOSITE is terminal
+         * (both interfaces always present) and never requests a switch. */
         if (usb_mode_req != usb_mode) {
             usb_deinit();
             if (usb_mode_req == USB_MODE_MSC)
@@ -65,7 +67,16 @@ int main(void)
             usb_init();
         }
 
-        if (usb_mode == USB_MODE_MSC) {
+        if (usb_mode == USB_MODE_COMPOSITE) {
+            /* Run both functions. The drive is shared cooperatively: hold off
+             * MSC track I/O while a gw flux command owns the drive (both drive
+             * the RDATA/WDATA timers), and let the WD177x-style idle check spin
+             * the motor down when neither is using it. */
+            floppy_process();
+            if (!floppy_busy())
+                msc_process();
+            ufi_motor_idle_check();
+        } else if (usb_mode == USB_MODE_MSC) {
             msc_process();
             ufi_motor_idle_check();
         } else {

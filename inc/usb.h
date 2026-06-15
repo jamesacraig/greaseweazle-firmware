@@ -22,12 +22,15 @@ struct usb_class_ops {
 extern const struct usb_class_ops usb_cdc_acm_ops;
 
 /*
- * Runtime device personality. The device enumerates as either the CDC-ACM
- * Greaseweazle (default) or a USB Mass-Storage (UFI) disk. usb_mode_req is set
- * to request a switch; the main loop applies it by re-initialising USB.
+ * Runtime device personality. The default is COMPOSITE: the device enumerates
+ * as a CDC-ACM Greaseweazle (gw tool) AND a USB Mass-Storage (UFI) disk at the
+ * same time, so the disk can be used while the gw control channel stays live.
+ * The legacy single-function CDC and MSC modes are retained (usb_mode_req +
+ * re-enumeration switches between CDC and MSC); COMPOSITE is terminal.
  */
 #define USB_MODE_CDC 0
 #define USB_MODE_MSC 1
+#define USB_MODE_COMPOSITE 2
 extern volatile uint8_t usb_mode;
 extern volatile uint8_t usb_mode_req;
 

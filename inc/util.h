@@ -104,6 +104,9 @@ static inline int printk(const char *format, ...) { return 0; }
 /* Floppy */
 void floppy_init(void);
 void floppy_process(void);
+/* TRUE while a gw flux command is mid-flight (not awaiting a new command). In
+ * composite mode the MSC track I/O must stand off the drive until this clears. */
+int floppy_busy(void);
 
 /* Test mode */
 uint8_t testmode_init(void);

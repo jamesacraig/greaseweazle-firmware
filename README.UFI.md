@@ -19,12 +19,28 @@ Built and tested on a **Greaseweazle V4.1** (AT32F403A). The codec is integer-on
   filesystem drivers / tools work (e.g. `mount` for FAT; ADFS/DFS at the sector
   level).
 
-## Personality switching
+## Personality (composite device)
 
-The device **defaults to USB Mass-Storage** (so it is bootable as a disk). To get
-back to the normal CDC/serial interface for the `gw` host tool (and for firmware
-updates), **eject the medium** (e.g. `eject /dev/sdX`), which returns it to CDC.
-`CMD_UFI_MOUNT` switches CDC → Mass-Storage on demand.
+By default the device enumerates as a **composite USB device** exposing **both**
+interfaces at once:
+
+- a **CDC-ACM serial port** for the `gw` host tool (and firmware updates), and
+- a **USB Mass-Storage disk** for the mounted floppy.
+
+So the disk is usable while the `gw` control channel stays live — no ejecting or
+mode-switching to run `gw` commands. An Interface Association Descriptor groups
+the CDC interfaces; the disk uses its own bulk endpoint pair (`0x84`/`0x05`).
+
+The drive is shared cooperatively: a `gw` flux command and Mass-Storage track
+I/O don't run at the same instant (Mass-Storage stands off while a `gw` flux
+command owns the drive), and the WD177x-style idle timer spins the motor down
+when neither is using it. CDC bulk endpoints are single-buffered in composite
+mode (to fit the USB packet-buffer budget alongside the MSC pair), so bulk `gw`
+flux streaming is slower than in the dedicated CDC firmware; the disk has its
+own endpoints and is unaffected.
+
+The legacy single-function personalities are retained in the code (a build/run
+could default to CDC-only or Mass-Storage-only), but composite is the default.
 
 ## Formats (validated on real hardware)
 

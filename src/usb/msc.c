@@ -57,10 +57,12 @@ const uint8_t msc_config_descriptor[] aligned(2) = {
  * usb_configure_ep() takes the full address (with the 0x80 IN bit); the
  * transfer calls (ep_*_ready / usb_read / usb_write) take the endpoint NUMBER
  * with direction implied (rx=OUT, tx=IN), matching the CDC code's convention. */
-#define MSC_EP_IN_ADDR  0x81
-#define MSC_EP_OUT_ADDR 0x02
-#define MSC_EP_IN  1   /* IN  endpoint number (for ep_tx_ready / usb_write) */
-#define MSC_EP_OUT 2   /* OUT endpoint number (for ep_rx_ready / usb_read)  */
+/* Endpoints 0x81/0x02/0x83 belong to the CDC function in composite mode, so MSC
+ * uses a fresh bulk pair. (Standalone MSC mode is happy on any pair too.) */
+#define MSC_EP_IN_ADDR  0x84
+#define MSC_EP_OUT_ADDR 0x05
+#define MSC_EP_IN  4   /* IN  endpoint number (for ep_tx_ready / usb_write) */
+#define MSC_EP_OUT 5   /* OUT endpoint number (for ep_rx_ready / usb_read)  */
 
 /* ---- Class-specific requests ---- */
 #define MSC_GET_MAX_LUN     0xfe
@@ -328,10 +330,14 @@ static void scsi_dispatch(void)
         break;
 
     case 0x1b: /* START STOP UNIT */
-        /* LOEJ (bit1 of cb[4]) with START=0 => eject: return to CDC mode. */
+        /* LOEJ (bit1 of cb[4]) with START=0 => eject. In the legacy MSC-only
+         * personality this drops back to the CDC tool interface; in composite
+         * mode CDC is always available, so it just unmounts the volume (it
+         * re-mounts on the next access while a disk is present). */
         if (cb[4] & 0x02) {
             disk_unmount();
-            usb_mode_req = USB_MODE_CDC;
+            if (usb_mode != USB_MODE_COMPOSITE)
+                usb_mode_req = USB_MODE_CDC;
         }
         st = ST_CSW;
         break;
