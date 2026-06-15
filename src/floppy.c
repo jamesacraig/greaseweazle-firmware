@@ -68,6 +68,7 @@ extern uint8_t u_buf[];
 #endif
 
 #include "codec/ibm.h"
+#include "codec/amiga.h"
 #include "disk.h"
 
 static struct index {
@@ -1592,6 +1593,11 @@ static int ufi_capture_decode(const struct ibm_fmt *f, int cyl, int head,
     floppy_flux_end();
     ibm_pll_flush(&pll);
 
+    if (f->codec == IBM_CODEC_AMIGA) {
+        struct amiga_fmt af = { f->nsec };
+        return amiga_scan_sectors(&af, (uint8_t)cyl, (uint8_t)head,
+                                  UFI_SCRATCH, pll.nbits, img, got);
+    }
     return ibm_scan_sectors(f, UFI_SCRATCH, pll.nbits, img, got);
 }
 
@@ -1699,8 +1705,14 @@ static uint8_t ufi_write_track(const struct ibm_fmt *f, int cyl, int head,
     /* Build the master track into the scratch area (bitcells), then stream it
      * out. The source image lives in a separate u_buf[] region (UFI_IMG/IMG2),
      * so it is not disturbed by the encode. */
-    ncellbytes = ibm_encode_track(f, cyl, head, img, UFI_SCRATCH,
-                                  U_BUF_SZ - 32*1024);
+    if (f->codec == IBM_CODEC_AMIGA) {
+        struct amiga_fmt af = { f->nsec };
+        ncellbytes = amiga_encode_track(&af, (uint8_t)cyl, (uint8_t)head, img,
+                                        UFI_SCRATCH, U_BUF_SZ - 32*1024);
+    } else {
+        ncellbytes = ibm_encode_track(f, cyl, head, img, UFI_SCRATCH,
+                                      U_BUF_SZ - 32*1024);
+    }
     return ufi_write_cells(f, UFI_SCRATCH, ncellbytes);
 }
 
@@ -2032,6 +2044,7 @@ static void process_command(void)
         f.gap3 = u_buf[10] | (u_buf[11] << 8);
         f.rate = u_buf[12] | (u_buf[13] << 8);
         f.rpm  = u_buf[14] | (u_buf[15] << 8);
+        f.codec = IBM_CODEC_IBM;
         cyl = u_buf[16];
         head = u_buf[17];
         revs = u_buf[18] ? u_buf[18] : 2;
@@ -2109,6 +2122,7 @@ static void process_command(void)
         f.gap3 = u_buf[10] | (u_buf[11] << 8);
         f.rate = u_buf[12] | (u_buf[13] << 8);
         f.rpm  = u_buf[14] | (u_buf[15] << 8);
+        f.codec = IBM_CODEC_IBM;
         cyl = u_buf[16];
         head = u_buf[17];
         revs = u_buf[18] ? u_buf[18] : 2;

@@ -43,6 +43,9 @@ struct disk_cand {
 };
 
 static const struct disk_cand cands[] = {
+    /* AmigaDOS 880K: 250kbps DD MFM, Amiga track structure (codec = AMIGA). */
+    { "AmigaDOS 880K",  80, { IBM_MFM, 11, 2, 0, 1, 0, 0, 0,   0, 250, 300,
+                              IBM_CODEC_AMIGA }, 0 },
     /* name           cyls  mode    nsec sec_n id il ck hk iam gap3 rate rpm  seq */
     { "PC 1.44M",       80, { IBM_MFM, 18, 2, 1, 1, 0, 0, 1,  84, 500, 300 }, 0 },
     { "PC 720K",        80, { IBM_MFM,  9, 2, 1, 1, 0, 0, 1,  84, 250, 300 }, 0 },

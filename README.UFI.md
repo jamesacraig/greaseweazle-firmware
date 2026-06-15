@@ -34,6 +34,7 @@ updates), **eject the medium** (e.g. `eject /dev/sdX`), which returns it to CDC.
 | Acorn ADFS 800K (D/E/F)    | MFM 1024B  | ✅   | –     |
 | Acorn ADFS 640K (L, 256B)  | MFM 256B   | ✅   | –     |
 | Acorn DFS ds80             | FM 256B    | ✅   | –     |
+| AmigaDOS 880K (DD)         | Amiga MFM  | codec round-trip validated; on-hardware test pending an Amiga disk | – |
 
 Notes:
 - Acorn double-sided disks record `h=0` in the sector headers on both sides; the

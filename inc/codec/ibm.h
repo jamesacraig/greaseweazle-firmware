@@ -30,6 +30,12 @@ enum ibm_mode { IBM_FM = 0, IBM_MFM = 1 };
 /* Largest sector payload we support (Acorn ADFS D/E/F = 1024). */
 #define IBM_MAX_SEC_BYTES 1024
 
+/* Which on-device codec decodes/encodes a track. AmigaDOS shares the 250kbps
+ * DD MFM bit rate (so the same PLL/flux path is used) but a different track
+ * structure handled by codec/amiga. */
+#define IBM_CODEC_IBM   0
+#define IBM_CODEC_AMIGA 1
+
 /* A fixed track format with uniform sector size. */
 struct ibm_fmt {
     uint8_t  mode;        /* enum ibm_mode */
@@ -43,6 +49,7 @@ struct ibm_fmt {
     uint16_t gap3;        /* post-DAM gap, in bytes */
     uint16_t rate;        /* data rate, kbps (125 / 250 / 500) */
     uint16_t rpm;         /* nominal RPM (300 / 360) */
+    uint8_t  codec;       /* IBM_CODEC_IBM (default) or IBM_CODEC_AMIGA */
 };
 
 /* sector payload size, in bytes */
