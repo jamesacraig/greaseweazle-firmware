@@ -2031,7 +2031,7 @@ static void process_command(void)
         int cyl, head, good;
         unsigned int revs;
         uint16_t img_crc;
-        if (len != 19)
+        if (len != 19 && len != 20)
             goto bad_command;
         f.mode = u_buf[2];
         f.nsec = u_buf[3];
@@ -2044,7 +2044,7 @@ static void process_command(void)
         f.gap3 = u_buf[10] | (u_buf[11] << 8);
         f.rate = u_buf[12] | (u_buf[13] << 8);
         f.rpm  = u_buf[14] | (u_buf[15] << 8);
-        f.codec = IBM_CODEC_IBM;
+        f.codec = (len == 20) ? u_buf[19] : IBM_CODEC_IBM;
         cyl = u_buf[16];
         head = u_buf[17];
         revs = u_buf[18] ? u_buf[18] : 2;
@@ -2109,7 +2109,7 @@ static void process_command(void)
         uint32_t tb, k, r;
         uint16_t rb_crc;
         uint8_t rc;
-        if (len != 19)
+        if (len != 19 && len != 20)
             goto bad_command;
         f.mode = u_buf[2];
         f.nsec = u_buf[3];
@@ -2122,7 +2122,7 @@ static void process_command(void)
         f.gap3 = u_buf[10] | (u_buf[11] << 8);
         f.rate = u_buf[12] | (u_buf[13] << 8);
         f.rpm  = u_buf[14] | (u_buf[15] << 8);
-        f.codec = IBM_CODEC_IBM;
+        f.codec = (len == 20) ? u_buf[19] : IBM_CODEC_IBM;
         cyl = u_buf[16];
         head = u_buf[17];
         revs = u_buf[18] ? u_buf[18] : 2;
