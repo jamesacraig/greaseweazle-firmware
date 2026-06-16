@@ -118,6 +118,7 @@ static enum {
     ST_DATA_IN,     /* sending data to host */
     ST_DATA_OUT,    /* receiving data from host */
     ST_DATA_IN_FAIL,/* terminate a failed data-in phase with a zero-length pkt */
+    ST_DATA_OUT_DISCARD,/* drain+discard a failed data-out phase, then status */
     ST_FORMAT_OUT,  /* receiving a FORMAT UNIT parameter list */
     ST_CSW,         /* send Command Status Wrapper */
 } st;
@@ -334,17 +335,22 @@ static void scsi_mode_sense10(void)
  * straight to the CSW. */
 static void finish_csw(void)
 {
-    /* For a data-IN command, if we finish before sending every byte the host
-     * asked for (cbw.len), its bulk-IN transfer is still open. Terminate it with
-     * a short (zero-length) packet FIRST; otherwise the host reads our 13-byte
-     * CSW as data, then blocks waiting for a CSW that never arrives -- tripping
-     * its ~30s command timeout and a bus reset. This must cover BOTH a read that
-     * produced no data (xferred==0) and one aborted partway through its extent
-     * (xferred>0: an unreadable sector mid-read, or the per-command budget).
-     * The previous `xferred==0` guard missed the partial case, which is the
-     * usual one and the real cause of the reset storm on a partly-bad disk. */
-    if ((cbw.flags & 0x80) && (xferred < cbw.len))
-        st = ST_DATA_IN_FAIL;
+    /* If the command's data phase isn't fully consumed (xferred < cbw.len), the
+     * host's bulk transfer is still open and must be terminated BEFORE the CSW,
+     * or the host blocks waiting on the data phase and trips its ~30s command
+     * timeout + a bus reset. Two directions:
+     *  - data-IN  (flags bit7=1): send a short (zero-length) packet so the host
+     *    ends its IN transfer; otherwise it reads our 13-byte CSW as data and
+     *    then waits for a CSW that never comes. Covers both no-data (xferred==0)
+     *    and partial (xferred>0: bad sector mid-read / per-command budget).
+     *  - data-OUT (flags bit7=0): drain and discard the bytes the host still
+     *    wants to send (e.g. a WRITE(10) rejected at dispatch -- write-protected
+     *    or not-ready), then send the failing status. Otherwise the host's
+     *    data-out transfer stalls.
+     * Commands with no data phase, or whose data already self-terminated with a
+     * trailing short packet, go straight to the CSW. */
+    if (xferred < cbw.len)
+        st = (cbw.flags & 0x80) ? ST_DATA_IN_FAIL : ST_DATA_OUT_DISCARD;
     else
         st = ST_CSW;
 }
@@ -500,10 +506,10 @@ static void scsi_dispatch(void)
          * read-modify-write read. */
         disk_write_extent(io_lba, data_total / DISK_BLOCK_SIZE);
         if (!disk_is_mounted()) {
-            SENSE_NOT_READY(); csw.status = 1; st = ST_CSW;
+            SENSE_NOT_READY(); csw.status = 1; finish_csw();
         } else if (disk_is_writeprotected()) {
             set_sense(0x07, 0x27, 0x00); /* data protect / write protected */
-            csw.status = 1; st = ST_CSW;
+            csw.status = 1; finish_csw();
         } else if (data_total == 0) {
             st = ST_CSW;
         } else {
@@ -521,9 +527,13 @@ static void scsi_dispatch(void)
         break;
 
     default:
+        /* Unsupported opcode -> CHECK CONDITION / ILLEGAL REQUEST. Route through
+         * finish_csw so that if the host attached a data phase (e.g. a probe for
+         * an optional data-IN command we don't implement) it is terminated
+         * rather than left open to time out. */
         SENSE_ILLEGAL_REQ();
         csw.status = 1;
-        st = ST_CSW;
+        finish_csw();
         break;
     }
 }
@@ -656,6 +666,24 @@ void msc_process(void)
         usb_write(MSC_EP_IN, blkbuf, 0);
         st = ST_CSW;
         break;
+
+    case ST_DATA_OUT_DISCARD: {
+        /* Drain and discard the data-out bytes the host still wants to send for
+         * a command rejected at dispatch (e.g. WRITE(10) to a write-protected or
+         * not-ready disk), then send the already-set failing status. csw.status
+         * and the sense were set by the dispatcher; don't touch them here. */
+        uint8_t junk[64];
+        len = ep_rx_ready(MSC_EP_OUT);
+        if (len < 0)
+            break;
+        if (len > (int)sizeof(junk))
+            len = sizeof(junk);
+        usb_read(MSC_EP_OUT, junk, len);
+        xferred += len;
+        if (xferred >= cbw.len)
+            st = ST_CSW;
+        break;
+    }
 
     case ST_CSW:
         if (ep_tx_ready(MSC_EP_IN))
