@@ -74,7 +74,28 @@ static struct {
     uint8_t sequential;       /* sides laid out sequentially (DFS double-sided) */
     int fmt_active;           /* a background low-level format is in progress */
     int fmt_track;            /* next physical track to format */
+    uint32_t wr_lba, wr_nblk; /* extent of the in-flight host write (0 = none) */
 } D;
+
+/* The host tells us the whole WRITE(10) extent up front (disk_write_extent); if
+ * it fully covers a track, that track's read-modify-write read can be skipped
+ * -- every sector is replaced before flush, so there's nothing to preserve. */
+void disk_write_extent(uint32_t lba, uint32_t nblk)
+{
+    D.wr_lba = lba;
+    D.wr_nblk = nblk;
+}
+
+static int write_covers_track(int cyl, int head)
+{
+    uint32_t trk, t0;
+    if (D.wr_nblk == 0)
+        return 0;
+    trk = D.sequential ? ((uint32_t)head * D.cyls + cyl)
+                       : ((uint32_t)cyl * D.heads + head);
+    t0 = trk * D.blocks_per_trk;
+    return (D.wr_lba <= t0) && (D.wr_lba + D.wr_nblk >= t0 + D.blocks_per_trk);
+}
 
 void disk_init(uint8_t *cache_buf)
 {
@@ -278,6 +299,19 @@ static int load_track(int cyl, int head, int for_write)
 
     if (disk_flush() < 0)
         return -1;
+
+    /* Full-track overwrite: skip the read-modify-write read -- every sector is
+     * replaced before flush, so there's nothing to preserve. Untouched sectors
+     * (none, for a genuine full-track write) default to blank. Roughly doubles
+     * bulk sequential write throughput. */
+    if (for_write && write_covers_track(cyl, head)) {
+        memset(D.cache, 0, D.track_bytes);
+        memset(D.got, 1, D.f.nsec);
+        D.cyl = cyl;
+        D.head = head;
+        D.dirty = 0;
+        return 0;
+    }
 
     memset(D.got, 0, sizeof(D.got)); /* fresh read: clear stale sector flags */
     rc = ufi_track_read(&D.f, cyl, head, D.cache, D.got, UFI_READ_REVS);

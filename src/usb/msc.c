@@ -467,6 +467,9 @@ static void scsi_dispatch(void)
         data_total = io_blocks * DISK_BLOCK_SIZE;
         if (data_total > cbw.len) data_total = cbw.len;
         buf_off = 0;
+        /* Tell the disk layer the full extent so fully-covered tracks skip the
+         * read-modify-write read. */
+        disk_write_extent(io_lba, data_total / DISK_BLOCK_SIZE);
         if (!disk_is_mounted()) {
             SENSE_NOT_READY(); csw.status = 1; st = ST_CSW;
         } else if (disk_is_writeprotected()) {

@@ -94,6 +94,10 @@ const struct ibm_fmt *disk_fmt(void);
 /* Block I/O. Each returns 0 on success, <0 on error. */
 int disk_read_block(uint32_t lba, uint8_t *buf);
 int disk_write_block(uint32_t lba, const uint8_t *buf);
+/* Tell the disk layer the full extent of an upcoming multi-block write so a
+ * fully-covered track can skip its read-modify-write read. Set before the
+ * blocks are streamed (e.g. at WRITE(10) dispatch). */
+void disk_write_extent(uint32_t lba, uint32_t nblk);
 int disk_flush(void);                  /* write back the dirty cached track */
 
 #endif /* __DISK_H__ */

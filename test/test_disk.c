@@ -21,6 +21,7 @@ static uint8_t mock_heads;
 static uint8_t mock_disk[2*1024*1024];
 static uint8_t mock_blank[4096];
 static int mock_wp;
+static int read_calls;   /* count backend track reads (to prove skip-RMW) */
 
 static uint32_t T(void) { return ibm_track_bytes(&mock_f); }
 
@@ -35,6 +36,7 @@ int ufi_track_read(const struct ibm_fmt *f, int cyl, int head,
 {
     uint32_t t = (uint32_t)(cyl*mock_heads + head);
     (void)revs;
+    read_calls++;
     memset(got, 0, f->nsec);
     if (!fmt_match(f) || cyl >= mock_cyls || head >= mock_heads)
         return 0;
@@ -169,6 +171,41 @@ static void test_sequential(void)
     printf("  blocks=%u mismatches=%u\n", nblk, bad);
 }
 
+/* A WRITE(10) that fully covers a track must skip the read-modify-write read. */
+static void test_full_track_skip(void)
+{
+    struct ibm_fmt pc = { IBM_MFM, 18, 2, 1, 1, 0, 0, 1, 84, 500, 300 };
+    uint32_t bpt, i, r0;
+    printf("Full-track write skips RMW read:\n");
+    setup_disk(&pc, 80, 2, 0 /*formatted*/);
+    disk_init(cache);
+    CHECK(disk_mount() == 0, "mount");
+    bpt = disk_blocks() / (80*2);            /* blocks per track */
+
+    /* Partial write (no extent) reads the track (RMW). */
+    read_calls = 0;
+    for (i = 0; i < 512; i++) blk[i] = (uint8_t)(i + 1);
+    CHECK(disk_write_block(bpt /*track 1, block 0*/, blk) == 0, "partial write");
+    CHECK(read_calls >= 1, "partial write does an RMW read");
+
+    /* Full-track write (extent covers all of track 2): no read. */
+    disk_flush();
+    read_calls = 0;
+    disk_write_extent(2*bpt, bpt);           /* whole of track 2 */
+    for (i = 0; i < bpt; i++) {
+        int k; for (k = 0; k < 512; k++) blk[k] = (uint8_t)(0x80 + i + k);
+        CHECK(disk_write_block(2*bpt + i, blk) == 0, "full-track block write");
+    }
+    CHECK(read_calls == 0, "full-track write skipped the RMW read");
+    CHECK(disk_flush() == 0, "flush");
+
+    /* Data persisted: reread track 2 block 0 via a fresh mount. */
+    disk_init(cache); disk_mount();
+    for (i = 0; i < 512; i++) blk[i] = (uint8_t)(0x80 + 0 + i);
+    CHECK(disk_read_block(2*bpt, blk2) == 0, "reread full-track block");
+    CHECK(memcmp(blk, blk2, 512) == 0, "full-track write persisted");
+}
+
 int main(void)
 {
     test_sequential();
@@ -182,6 +219,7 @@ int main(void)
     test_readback("ADFS 800K auto-detect", &adfs8, 80, 2);
     test_rmw();
     test_format_then_write();
+    test_full_track_skip();
 
     printf("\n%s (%d failures)\n", fails ? "FAILED" : "ALL PASSED", fails);
     return fails ? 1 : 0;
