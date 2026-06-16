@@ -1584,10 +1584,22 @@ static int ufi_capture_decode(const struct ibm_fmt *f, int cyl, int head,
             prev = curr;
             cons = (cons + 1) & bmask;
         }
+        /* Service USB while we capture. This decode is a multi-revolution
+         * blocking call (and, on a marginal/undecodable track, runs several
+         * times via the read-retry path), during which the main loop -- and
+         * thus usb_process() -- would otherwise stall. A stalled control
+         * endpoint means the host's storage error-handler cannot complete its
+         * abort / Bulk-Only-Reset / clear-halt handshake, so a single slow read
+         * escalates into a hung device. Pumping it here keeps EP0 alive so the
+         * host can always recover. (usbd_process only touches USB endpoint
+         * state; it never re-enters the disk layer, so this is safe here.) */
+        usb_process();
         if (index.count >= revs)
             break;
-        if (time_since(start) >= time_ms(2000))
-            break; /* no/insufficient index */
+        if (time_since(start) >= time_ms(1000))
+            break; /* no/insufficient index (a spinning disk indexes every
+                    * ~200ms; 1s is ample for `revs` and keeps a doomed,
+                    * index-less capture from stretching the per-block fetch). */
     }
 
     floppy_flux_end();
@@ -1642,9 +1654,11 @@ static uint8_t ufi_write_cells(const struct ibm_fmt *f,
     /* Cue the write to the index pulse for a consistent splice position. */
     index.count = 0;
     start = time_now();
-    while (index.count == 0)
+    while (index.count == 0) {
+        usb_process(); /* keep USB alive while waiting (pre-WGATE, so safe) */
         if (time_since(start) >= time_ms(2000))
             return ACK_NO_INDEX;
+    }
 
     dma_wdata_start();
     tim_wdata->egr = TIM_EGR_UG;
@@ -1737,8 +1751,10 @@ static void ufi_motor_run(void)
         /* Wait up to ~6 revolutions for the spindle to reach a stable speed. */
         index.count = 0;
         deadline = time_now() + time_ms(UFI_SPINUP_REVS * UFI_REV_MS + 300);
-        while ((index.count < UFI_SPINUP_REVS) && (time_since(deadline) < 0))
+        while ((index.count < UFI_SPINUP_REVS) && (time_since(deadline) < 0)) {
+            usb_process(); /* keep USB alive during the ~1s spin-up wait */
             cpu_relax();
+        }
     }
     ufi_last_access = time_now();
 }
@@ -1838,13 +1854,30 @@ int ufi_media_check(int may_probe)
         /* Line HIGH: a disk is seated, unchanged since the last step. */
         ufi_media_seated = TRUE;
     } else if (seated_before) {
-        /* Line asserted while we believed a disk seated: it was removed. No
-         * step needed — the latch reads LOW on its own. Hold off insertion-
-         * probing for a cooldown so the host's removal-revalidation burst
-         * (READ CAPACITY / partition-table READ) does not immediately rattle
-         * the head chasing a disk that was just taken out. */
-        ufi_media_seated = FALSE;
-        ufi_probe_block_until = time_now() + time_ms(UFI_PROBE_COOLDOWN_MS);
+        /* Line LOW while we believed a disk seated. This is EITHER a genuine
+         * removal OR a false latch: the DISK CHANGE latch also reads LOW simply
+         * because the drive was deselected (motor idled) and reselected since
+         * the last access -- with the disk still in. Treating that as a removal
+         * spuriously unmounts a present disk (the host then sees "medium not
+         * present" mid-operation). Distinguish the two with a STEP probe, which
+         * is exactly how insertion is detected: a present disk clears the latch
+         * back HIGH, a removed one stays LOW. Only step on an active access
+         * (passive readiness polls must never move the head); a passive poll
+         * cannot confirm, so it leaves our belief unchanged and defers to the
+         * next active access. One step clears the latch, so a steady-state run
+         * of reads does not chatter. */
+        if (may_probe) {
+            ufi_step_pulse();
+            if (ufi_dskchg() == 1) {
+                ufi_media_seated = TRUE;  /* false alarm: disk still present */
+            } else {
+                ufi_media_seated = FALSE; /* confirmed removed */
+                ufi_probe_block_until =
+                    time_now() + time_ms(UFI_PROBE_COOLDOWN_MS);
+            }
+        }
+        /* else: passive poll -- keep believing seated until an active access
+         * can confirm with a step. */
     } else if (may_probe && (time_since(ufi_probe_block_until) >= 0)) {
         /* Believed empty and the host is actively accessing: pulse STEP to
          * clear the latch and see whether a disk has since been inserted. Rate-

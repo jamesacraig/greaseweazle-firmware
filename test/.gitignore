@@ -3,3 +3,4 @@ test_disk
 test_realflux
 test_amiga
 test_amiga_realflux
+__pycache__/

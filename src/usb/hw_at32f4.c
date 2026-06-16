@@ -12,6 +12,7 @@
 #include "hw_dwc_otg.h"
 
 static const struct usb_driver *drv;
+static bool_t usb_up; /* TRUE only between hw_usb_init and hw_usb_deinit */
 
 void hw_usb_init(void)
 {
@@ -38,10 +39,12 @@ void hw_usb_init(void)
     }
 
     drv->init();
+    usb_up = TRUE;
 }
 
 void hw_usb_deinit(void)
 {
+    usb_up = FALSE;
     drv->deinit();
 
     switch (at32f4_series) {
@@ -98,7 +101,12 @@ void usb_setaddr(uint8_t addr)
 
 void usb_process(void)
 {
-    drv->process();
+    /* No-op until the controller is initialised. The UFI track-I/O path pumps
+     * usb_process() from inside blocking captures, and that path also runs at
+     * boot (and during a mode switch) before/after the USB stack is up, when
+     * drv->process() would dereference uninitialised state. */
+    if (usb_up)
+        drv->process();
 }
 
 /*

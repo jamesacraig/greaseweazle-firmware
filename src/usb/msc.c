@@ -123,6 +123,14 @@ static uint32_t io_blocks;    /* blocks still to fetch/store from disk */
 static uint32_t buf_off;      /* byte offset within blkbuf */
 static uint32_t data_total;   /* total bytes to transfer in the data phase */
 static uint32_t xferred;      /* bytes transferred in the data phase so far */
+static time_t io_deadline;    /* wall-clock cap for the current data phase */
+/* A single command's data phase must finish well within the host's ~30s SCSI
+ * command timeout, else the host aborts and port-resets the device. A read that
+ * spans many slow/marginal tracks (e.g. a large partition-probe readahead over a
+ * crusty disk) can otherwise blow that budget. Cap it: once exceeded, the next
+ * track fetch returns a medium error instead of being attempted, so the command
+ * always completes (success or clean error) in bounded time. */
+#define IO_BUDGET_MS 12000
 static uint8_t fmt_buf[40];   /* FORMAT UNIT parameter list */
 static uint32_t fmt_got, fmt_total;
 
@@ -319,8 +327,16 @@ static void scsi_mode_sense10(void)
  * straight to the CSW. */
 static void finish_csw(void)
 {
-    if ((cbw.flags & 0x80) && (cbw.len != 0) && (xferred == 0)
-        && (csw.status != 0))
+    /* For a data-IN command, if we finish before sending every byte the host
+     * asked for (cbw.len), its bulk-IN transfer is still open. Terminate it with
+     * a short (zero-length) packet FIRST; otherwise the host reads our 13-byte
+     * CSW as data, then blocks waiting for a CSW that never arrives -- tripping
+     * its ~30s command timeout and a bus reset. This must cover BOTH a read that
+     * produced no data (xferred==0) and one aborted partway through its extent
+     * (xferred>0: an unreadable sector mid-read, or the per-command budget).
+     * The previous `xferred==0` guard missed the partial case, which is the
+     * usual one and the real cause of the reset storm on a partly-bad disk. */
+    if ((cbw.flags & 0x80) && (xferred < cbw.len))
         st = ST_DATA_IN_FAIL;
     else
         st = ST_CSW;
@@ -452,6 +468,7 @@ static void scsi_dispatch(void)
         data_total = io_blocks * DISK_BLOCK_SIZE;
         if (data_total > cbw.len) data_total = cbw.len;
         buf_off = DISK_BLOCK_SIZE; /* force a fetch on first DATA_IN step */
+        io_deadline = time_now() + time_ms(IO_BUDGET_MS);
         if (!disk_is_mounted()) {
             SENSE_NOT_READY(); csw.status = 1; finish_csw();
         } else if (data_total == 0) {
@@ -541,8 +558,23 @@ void msc_process(void)
         if (!ep_tx_ready(MSC_EP_IN))
             break;
         if (buf_off >= DISK_BLOCK_SIZE) {
+            int rc;
+            /* Bound total command latency: a fetch that crosses into a new
+             * track can block for ~seconds, and a read spanning many slow tracks
+             * would otherwise exceed the host's command timeout. Once over
+             * budget, fail the rest of the transfer cleanly. */
+            if (time_since(io_deadline) >= 0) {
+                SENSE_MEDIUM_ERR(); csw.status = 1; finish_csw(); break;
+            }
             /* Fetch the next block of a READ(10) stream. */
-            if (disk_read_block(io_lba, blkbuf) < 0) {
+            rc = disk_read_block(io_lba, blkbuf);
+            /* disk_read_block can block for many ms while a track is captured;
+             * usb_process() runs during that time, so a host Bulk-Only-Reset may
+             * have moved us back to ST_CBW. If so, abandon this stale transfer
+             * (don't emit a CSW for a command the host has discarded). */
+            if (st != ST_DATA_IN)
+                break;
+            if (rc < 0) {
                 SENSE_MEDIUM_ERR(); csw.status = 1; finish_csw(); break;
             }
             io_lba++; io_blocks--; buf_off = 0;
@@ -568,7 +600,12 @@ void msc_process(void)
         buf_off += len;
         xferred += len;
         if (buf_off >= DISK_BLOCK_SIZE) {
-            if (disk_write_block(io_lba, blkbuf) < 0) {
+            int rc = disk_write_block(io_lba, blkbuf);
+            /* A Bulk-Only-Reset may have landed during the blocking write
+             * (usb_process() runs inside the track read-modify-write). */
+            if (st != ST_DATA_OUT)
+                break;
+            if (rc < 0) {
                 SENSE_WRITE_ERR(); csw.status = 1;
             }
             io_lba++; io_blocks--; buf_off = 0;

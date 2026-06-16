@@ -318,7 +318,14 @@ static int load_track(int cyl, int head, int for_write)
     if (rc < 0)
         return -1; /* seek / hard error */
 
-    /* Retry while sectors are still missing. */
+    /* Retry while sectors are still missing. Sectors accumulate across attempts
+     * (the codec keeps the best-CRC copy of each), and a marginal track often
+     * recovers a sector on a later revolution even after a pass that gained
+     * nothing -- so we always use the full UFI_READ_TRIES budget rather than
+     * giving up on the first no-progress pass. The total time is bounded (each
+     * capture is capped by its index/timeout), and an unreadable read now fails
+     * the host cleanly via the data-phase termination in msc.c, so it no longer
+     * needs a premature bail-out here. */
     for (tries = 1; tries < UFI_READ_TRIES; tries++) {
         ngot = 0;
         for (s = 0; s < D.f.nsec; s++)
