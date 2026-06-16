@@ -72,6 +72,14 @@ int disk_mount_described(const struct ufi_format_desc *d);
 /* Select a built-in format by its (unique) logical block count. <0 if none. */
 int disk_mount_capacity(uint32_t blocks);
 
+/* Low-level format (destructive) to a built-in format selected by block count.
+ * Starts a background format (writes every track blank-formatted); the caller
+ * pumps disk_format_step() each loop until disk_format_busy() clears. Returns 0
+ * on success, <0 if no such format or the medium is write-protected. */
+int disk_format_start(uint32_t blocks);
+int disk_format_busy(void);
+void disk_format_step(void);
+
 /* Built-in format table introspection (for READ FORMAT CAPACITIES and helpers). */
 int disk_num_formats(void);
 /* Nominal capacity (full-geometry block count) of built-in format `idx`, and its

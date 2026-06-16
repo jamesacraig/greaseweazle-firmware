@@ -7,15 +7,17 @@
 # Usage (device auto-detected if omitted):
 #   ufi_scsi.py [/dev/sdX] list                 list formats + current capacity
 #   ufi_scsi.py [/dev/sdX] auto                  re-run format auto-detection
-#   ufi_scsi.py [/dev/sdX] format <name|blocks>  force a built-in format
-#   ufi_scsi.py [/dev/sdX] describe <14 fields>  apply an arbitrary format
+#   ufi_scsi.py [/dev/sdX] format <name|blocks>  DESTRUCTIVE low-level format to a
+#                                                built-in format (writes all tracks)
+#   ufi_scsi.py [/dev/sdX] describe <14 fields>  non-destructively set an arbitrary
+#                                                format (changes interpretation only)
 #   ufi_scsi.py [/dev/sdX] cdc                   switch to CDC mode (flux imaging)
 #
 # describe fields: enc cyls heads nsec sec_n id interleave cskew hskew iam
 #                  gap3 rate rpm flags     (enc: 0=FM 1=MFM 2=Amiga; flags bit0
 #                  sequential, bit1 ignore-head)
 
-import ctypes, fcntl, os, struct, sys, glob
+import ctypes, fcntl, os, struct, sys, glob, time
 
 SG_IO = 0x2285
 TO_DEV, FROM_DEV, NONE = -2, -3, -1
@@ -119,7 +121,20 @@ def cmd_format(dev, arg):
             sys.exit("Unknown format '%s' (try: list)" % arg)
     p = format_param(blocks)
     st, sk, _ = sg(dev, [0x04, 0x10, 0, 0, 0, 0], TO_DEV, data=p)
-    print("FORMAT UNIT capacity=%u -> status=%d sense_key=%d" % (blocks, st, sk))
+    print("FORMAT UNIT capacity=%u -> status=%d (low-level format, in background)"
+          % (blocks, st))
+    if st != 0:
+        print("  rejected (sense_key=%d) -- write-protected or unknown capacity" % sk)
+        return
+    # The format runs in the background; poll TEST UNIT READY until it completes.
+    sys.stdout.write("  formatting"); sys.stdout.flush()
+    for _ in range(360):                       # up to ~3 min
+        s2, _k2, _ = sg(dev, [0, 0, 0, 0, 0, 0], NONE)   # TEST UNIT READY
+        if s2 == 0:
+            print(" done (ready)."); return
+        sys.stdout.write("."); sys.stdout.flush()
+        time.sleep(0.5)
+    print(" timed out waiting for completion.")
 
 def cmd_describe(dev, f):
     enc, cyls, heads, nsec, sec_n, sid, il, cskew, hskew, iam, gap3, rate, rpm, flags = \

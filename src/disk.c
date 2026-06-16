@@ -72,6 +72,8 @@ static struct {
     uint8_t got[64];          /* per-logical-sector valid flags for cache */
     int dirty;
     uint8_t sequential;       /* sides laid out sequentially (DFS double-sided) */
+    int fmt_active;           /* a background low-level format is in progress */
+    int fmt_track;            /* next physical track to format */
 } D;
 
 void disk_init(uint8_t *cache_buf)
@@ -206,6 +208,43 @@ void disk_unmount(void)
     D.mounted = 0;
     D.cyl = D.head = -1;
     D.dirty = 0;
+    D.fmt_active = 0;
+}
+
+/* --- Background low-level format (FORMAT UNIT without a vendor descriptor) ---
+ * Select a built-in format by capacity, then write every track as a blank,
+ * fully-formatted track. Done one track per disk_format_step() so the USB bus
+ * is serviced between tracks (the host polls TEST UNIT READY meanwhile) and we
+ * never block in one long stall. This is a write-only operation (no read-modify-
+ * write), so it stays in the robust path that gw erase already exercises. */
+int disk_format_start(uint32_t blocks)
+{
+    if (disk_mount_capacity(blocks) < 0)   /* set the target geometry */
+        return -1;
+    if (ufi_writeprotected()) {
+        disk_unmount();
+        return -1;
+    }
+    D.fmt_track = 0;
+    D.fmt_active = 1;
+    return 0;
+}
+
+int disk_format_busy(void) { return D.fmt_active; }
+
+void disk_format_step(void)
+{
+    int cyl, head;
+    if (!D.fmt_active)
+        return;
+    cyl  = D.fmt_track / D.heads;
+    head = D.fmt_track % D.heads;
+    memset(D.cache, 0, D.track_bytes);          /* blank sector data */
+    ufi_track_write(&D.f, cyl, head, D.cache);  /* writes a fully-formatted track */
+    if (++D.fmt_track >= (int)D.cyls * D.heads) {
+        D.fmt_active = 0;
+        D.cyl = D.head = -1;                    /* cache reflects no live track */
+    }
 }
 
 int disk_is_mounted(void) { return D.mounted; }
@@ -232,7 +271,7 @@ uint32_t disk_blocks(void)
 static int load_track(int cyl, int head, int for_write)
 {
     int rc, ngot, tries;
-    uint32_t s, secsz;
+    uint32_t s;
 
     if (D.mounted && D.cyl == cyl && D.head == head)
         return 0;
@@ -255,10 +294,14 @@ static int load_track(int cyl, int head, int for_write)
         ufi_track_read(&D.f, cyl, head, D.cache, D.got, UFI_READ_REVS);
     }
 
-    secsz = ibm_sec_bytes(&D.f);
-    for (s = 0; s < D.f.nsec; s++) {
-        if (!D.got[s] && for_write)
-            memset(D.cache + s*secsz, 0, secsz); /* define for write-back */
+    /* For a read-modify-write, every sector of the track must be readable so the
+     * ones we are NOT overwriting are preserved. If any are missing the track is
+     * not (properly) formatted -- fail the write rather than silently fabricate
+     * zeroed sectors. Low-level format the disk first (disk_format_start). */
+    if (for_write) {
+        for (s = 0; s < D.f.nsec; s++)
+            if (!D.got[s])
+                return -1;
     }
 
     D.cyl = cyl;

@@ -98,6 +98,7 @@ static void set_sense(uint8_t k, uint8_t asc, uint8_t ascq)
 #define SENSE_MEDIUM_ERR()  set_sense(0x03, 0x11, 0x00) /* unrecovered read */
 #define SENSE_WRITE_ERR()   set_sense(0x03, 0x0c, 0x00) /* write fault */
 #define SENSE_UA_CHANGED()  set_sense(0x06, 0x28, 0x00) /* not-rdy->rdy, medium changed */
+#define SENSE_FORMATTING()  set_sense(0x02, 0x04, 0x04) /* not ready, format in progress */
 
 /* A UNIT ATTENTION condition (power-on or media change) is pending: the next
  * command other than INQUIRY / REQUEST SENSE is failed with CHECK CONDITION so
@@ -274,9 +275,11 @@ static void apply_format_unit(void)
         d.rate       = fmt_buf[25] | ((uint16_t)fmt_buf[26] << 8);
         d.rpm        = fmt_buf[27] | ((uint16_t)fmt_buf[28] << 8);
         d.flags      = fmt_buf[29];
-        rc = disk_mount_described(&d);
+        rc = disk_mount_described(&d);   /* vendor descriptor: non-destructive */
     } else if (fmt_got >= 12) {
-        rc = disk_mount_capacity(rd_be32(fmt_buf + 4));
+        /* No vendor descriptor: a real (destructive) low-level format of the
+         * built-in selected by capacity, written in the background. */
+        rc = disk_format_start(rd_be32(fmt_buf + 4));
     }
     if (rc == 0) {
         ua_pending = TRUE;           /* host re-reads the new geometry */
@@ -336,9 +339,23 @@ static void scsi_dispatch(void)
      * Only the active-access commands (READ CAPACITY / READ / WRITE) may pulse
      * STEP to probe for a newly inserted disk; passive readiness polls never
      * move the head, so an idle empty drive stays silent. */
-    /* FORMAT UNIT (0x04, has a data-out phase to drain) and the vendor mode
-     * switch (0xc0) must run regardless of a pending UA, like INQUIRY/SENSE. */
-    if (cb[0] != 0x12 && cb[0] != 0x03 && cb[0] != 0x04 && cb[0] != 0xc0) {
+    if (disk_format_busy()) {
+        /* A background low-level format owns the drive: do NOT run the media-
+         * change check (it touches the drive and would disk_unmount(), which
+         * cancels the format). Tell the host the medium is not ready yet for
+         * medium-access commands; let INQUIRY / REQUEST SENSE / FORMAT UNIT /
+         * the mode-switch fall through. */
+        if (cb[0]==0x00 || cb[0]==0x25 || cb[0]==0x28 || cb[0]==0x2a) {
+            SENSE_FORMATTING();
+            csw.status = 1;
+            finish_csw();
+            return;
+        }
+    } else if (cb[0] != 0x12 && cb[0] != 0x03 && cb[0] != 0x04 && cb[0] != 0xc0) {
+        /* Detect medium insertion/removal and surface it as UNIT ATTENTION.
+         * FORMAT UNIT (0x04, has a data-out phase to drain) and the vendor mode
+         * switch (0xc0) are excluded -- they must run regardless of a pending
+         * UA, like INQUIRY / REQUEST SENSE. */
         int active = (cb[0] == 0x25 || cb[0] == 0x28 || cb[0] == 0x2a);
         int chg = ufi_media_check(active);
         if (chg) {
@@ -493,6 +510,11 @@ static void send_csw(void)
 void msc_process(void)
 {
     int len;
+
+    /* Drive a background low-level format one track per pass, so the bus is
+     * serviced between tracks (host polls TEST UNIT READY meanwhile). */
+    if (disk_format_busy())
+        disk_format_step();
 
     switch (st) {
 

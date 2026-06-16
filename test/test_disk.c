@@ -116,25 +116,33 @@ static void test_rmw(void)
     CHECK(memcmp(blk2, mock_disk + (lba^1)*512, 512) == 0, "neighbour intact");
 }
 
-static void test_blank_format(void)
+static void test_format_then_write(void)
 {
-    struct ibm_fmt pc = { IBM_MFM, 18, 2, 1, 1, 0, 0, 1, 84, 500, 300 };
-    int i; uint32_t lba = 0;
-    printf("Blank-disk write (PC1440 forced, RMW zero-fill):\n");
-    setup_disk(&pc, 80, 2, 1 /*blank*/);
+    int i, guard = 0; uint32_t lba = 0;
+    uint32_t blocks = (uint32_t)80*2*18; /* PC 1.44M nominal capacity */
+    printf("Format-then-write (blank disk):\n");
+    setup_disk(&(struct ibm_fmt){ IBM_MFM, 18, 2, 1, 1, 0, 0, 1, 84, 500, 300 },
+               80, 2, 1 /*blank*/);
     disk_init(cache);
-    /* Auto-detect fails on a blank disk; force the geometry. */
     CHECK(disk_mount() != 0, "auto-detect fails on blank disk");
-    CHECK(disk_mount_forced(&pc, 80, 2) == 0, "forced mount");
+    CHECK(disk_mount_capacity(blocks) == 0, "select PC1440 by capacity");
+    /* Writing an unformatted track must FAIL now (no silent zero-fill). */
     for (i = 0; i < 512; i++) blk[i] = (uint8_t)(i ^ 0x5a);
-    CHECK(disk_write_block(lba, blk) == 0, "write to blank track");
+    CHECK(disk_write_block(lba, blk) != 0, "write to unformatted track fails");
+    /* Low-level format the whole disk, then writes succeed. */
+    CHECK(disk_format_start(blocks) == 0, "format start");
+    while (disk_format_busy() && guard++ < 100000) disk_format_step();
+    CHECK(!disk_format_busy(), "format completed");
+    CHECK(disk_write_block(lba, blk) == 0, "write after format");
     CHECK(disk_flush() == 0, "flush");
-    disk_init(cache); disk_mount_forced(&pc, 80, 2);
+    /* Fresh mount (now auto-detects, the disk is formatted) and verify. */
+    disk_init(cache);
+    CHECK(disk_mount() == 0, "auto-detect after format");
     CHECK(disk_read_block(lba, blk2) == 0, "reread written block");
-    CHECK(memcmp(blk, blk2, 512) == 0, "blank-track write persisted");
-    /* Another block in same track (sector 1, was zero-filled) reads as 0. */
-    CHECK(disk_read_block(1, blk2) == 0, "reread zero-filled block");
-    for (i = 0; i < 512; i++) if (blk2[i] != 0) { CHECK(0, "zero-fill"); break; }
+    CHECK(memcmp(blk, blk2, 512) == 0, "write persisted");
+    /* A neighbouring sector is blank-formatted (zero). */
+    CHECK(disk_read_block(1, blk2) == 0, "reread neighbour");
+    for (i = 0; i < 512; i++) if (blk2[i] != 0) { CHECK(0, "neighbour blank(zero)"); break; }
 }
 
 /* DFS double-sided: sides must be laid out sequentially (all head 0, then all
@@ -173,7 +181,7 @@ int main(void)
     test_readback("PC 720K auto-detect", &pc720, 80, 2);
     test_readback("ADFS 800K auto-detect", &adfs8, 80, 2);
     test_rmw();
-    test_blank_format();
+    test_format_then_write();
 
     printf("\n%s (%d failures)\n", fails ? "FAILED" : "ALL PASSED", fails);
     return fails ? 1 : 0;
