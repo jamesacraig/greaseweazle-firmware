@@ -359,8 +359,10 @@ static void scsi_dispatch(void)
     switch (cb[0]) {
 
     case 0x00: /* TEST UNIT READY */
-        if (!disk_is_mounted() && ufi_media_present())
-            disk_mount();
+        /* Don't auto-detect-mount here: mounting happens at power-on, on a
+         * detected media change, and via FORMAT UNIT. Re-probing a present but
+         * unmountable disk (blank/unformatted) on every poll would spin the
+         * motor on each poll (it never idles down). */
         if (disk_is_mounted()) { SENSE_OK(); csw.status = 0; }
         else { SENSE_NOT_READY(); csw.status = 1; }
         st = ST_CSW;
@@ -423,13 +425,11 @@ static void scsi_dispatch(void)
         break;
 
     case 0x25: /* READ CAPACITY (10) */
-        if (!disk_is_mounted() && ufi_media_present()) disk_mount();
         if (!disk_is_mounted()) { SENSE_NOT_READY(); csw.status = 1; finish_csw(); }
         else scsi_read_capacity();
         break;
 
     case 0x28: /* READ (10) */
-        if (!disk_is_mounted() && ufi_media_present()) disk_mount();
         io_lba = rd_be32(cb + 2);
         io_blocks = rd_be16(cb + 7);
         data_total = io_blocks * DISK_BLOCK_SIZE;
@@ -450,7 +450,6 @@ static void scsi_dispatch(void)
         data_total = io_blocks * DISK_BLOCK_SIZE;
         if (data_total > cbw.len) data_total = cbw.len;
         buf_off = 0;
-        if (!disk_is_mounted() && ufi_media_present()) disk_mount();
         if (!disk_is_mounted()) {
             SENSE_NOT_READY(); csw.status = 1; st = ST_CSW;
         } else if (disk_is_writeprotected()) {
