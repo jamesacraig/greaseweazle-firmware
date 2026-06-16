@@ -283,11 +283,15 @@ uint32_t disk_blocks(void)
  * the whole track image is defined for a subsequent flush. Returns 0 on success
  * (cache valid), <0 on a hard error (seek failure). */
 /* Per-capture revolutions, and how many full re-reads to attempt to recover a
- * track. Like a floppy controller + driver: read a couple of revolutions, and
- * retry the read a few times before declaring an unrecoverable error. Sectors
- * accumulate across attempts (the codec keeps the best-CRC copy of each). */
-#define UFI_READ_REVS  2
-#define UFI_READ_TRIES 4
+ * track. Like a floppy controller + driver: read a few revolutions, and retry
+ * the read several times before declaring an unrecoverable error. Sectors
+ * accumulate across attempts (the codec keeps the best-CRC copy of each), so a
+ * marginal/crusty disk recovers a few more sectors on later revolutions -- this
+ * matches the persistence of `gw read` (which recovers such disks to 100%). The
+ * total time is bounded by the per-command budget in msc.c, and an ultimately
+ * unreadable read fails the host cleanly, so being generous here is safe. */
+#define UFI_READ_REVS  3
+#define UFI_READ_TRIES 6
 
 static int load_track(int cyl, int head, int for_write)
 {
