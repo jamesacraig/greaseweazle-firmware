@@ -38,12 +38,19 @@ const uint8_t msc_config_descriptor[] aligned(2) = {
     0,                 /* iConfiguration */
     0x80,              /* bmAttributes: bus powered */
     0xfa,              /* bMaxPower: 500mA */
-    /* Interface: Mass Storage, SCSI transparent, Bulk-Only */
+    /* Interface: Mass Storage, UFI (floppy), Bulk-Only.
+     * SubClass 0x04 = UFI: the host treats this as a floppy drive (udev's
+     * 80-udisks2.rules tags bInterfaceSubClass==04 with ID_DRIVE_FLOPPY=1, so
+     * the desktop shows a floppy icon, not a generic removable-disk icon, and
+     * file managers give it floppy-appropriate handling). UFI rides the same
+     * Bulk-Only transport and the same READ(10)/WRITE(10)/READ CAPACITY/etc.
+     * opcodes we already implement; the host just pads CDBs to 12 bytes, which
+     * our opcode+fixed-offset dispatch ignores. (Was 0x06 SCSI-transparent.) */
     9, DESC_INTERFACE,
     0,                 /* bInterfaceNumber */
     0,                 /* bAlternateSetting */
     2,                 /* bNumEndpoints */
-    0x08, 0x06, 0x50,  /* Mass Storage / SCSI / Bulk-Only */
+    0x08, 0x04, 0x50,  /* Mass Storage / UFI / Bulk-Only */
     0,                 /* iInterface */
     /* Bulk IN endpoint */
     7, DESC_ENDPOINT,
@@ -352,9 +359,13 @@ static void scsi_dispatch(void)
     /* Detect medium insertion/removal and surface it as UNIT ATTENTION. Skip
      * the INQUIRY / REQUEST SENSE handshake (the host uses those to identify
      * the device and to drain a pending sense, so they must always proceed).
-     * Only the active-access commands (READ CAPACITY / READ / WRITE) may pulse
-     * STEP to probe for a newly inserted disk; passive readiness polls never
-     * move the head, so an idle empty drive stays silent. */
+     * The medium-access commands -- TEST UNIT READY / READ CAPACITY / READ /
+     * WRITE -- may pulse STEP (rate-limited) to probe for a newly inserted disk.
+     * TUR is included because, after a no-medium boot, Linux "stops polling" the
+     * device and only re-checks media via TUR when something actually opens it
+     * (e.g. `mount`/`cat`); a disk inserted after startup is invisible unless
+     * that TUR steps to clear the DISK CHANGE latch. The probe cooldown keeps an
+     * empty, actively-polled drive from chattering more than once per few sec. */
     if (disk_format_busy()) {
         /* A background low-level format owns the drive: do NOT run the media-
          * change check (it touches the drive and would disk_unmount(), which
@@ -372,7 +383,8 @@ static void scsi_dispatch(void)
          * FORMAT UNIT (0x04, has a data-out phase to drain) and the vendor mode
          * switch (0xc0) are excluded -- they must run regardless of a pending
          * UA, like INQUIRY / REQUEST SENSE. */
-        int active = (cb[0] == 0x25 || cb[0] == 0x28 || cb[0] == 0x2a);
+        int active = (cb[0] == 0x00 || cb[0] == 0x25 ||
+                      cb[0] == 0x28 || cb[0] == 0x2a);
         int chg = ufi_media_check(active);
         if (chg) {
             disk_unmount();
