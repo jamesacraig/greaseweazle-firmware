@@ -43,7 +43,17 @@ extern uint16_t crc16_ccitt(const void *buf, size_t len, uint16_t crc);
 /* PLL tuning (see track.py flux_to_bitcells). Defaults: period=5%, phase=60%. */
 #define PLL_PERIOD_PCT 5
 #define PLL_PHASE_PCT  60
-#define PLL_CLAMP_PCT  10
+/* Max deviation of the recovered bitcell clock from the nominal rate. gw uses
+ * 10% but FIRST normalises the flux to the nominal time-per-rev (centring the
+ * clock on the true disk speed). We feed raw flux without that normalisation,
+ * so the clamp must additionally absorb the drive's spindle-speed offset --
+ * with 10% a fast drive rails the clock at the clamp edge and marginal sectors
+ * (e.g. right after the index/splice gap) fail to decode even though gw reads
+ * them from identical flux. 20% gives headroom for spindle offset + local
+ * timing variation; still far from the 50% that would risk half/double-rate
+ * mislock. (Validated: recovers a sector our 10% clamp missed, byte-identical
+ * to gw, with no false decodes.) */
+#define PLL_CLAMP_PCT  20
 #define FRAC 8 /* fixed-point fractional bits for PLL tick/clock units */
 
 /*
