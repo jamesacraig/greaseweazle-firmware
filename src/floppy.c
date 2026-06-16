@@ -1854,30 +1854,18 @@ int ufi_media_check(int may_probe)
         /* Line HIGH: a disk is seated, unchanged since the last step. */
         ufi_media_seated = TRUE;
     } else if (seated_before) {
-        /* Line LOW while we believed a disk seated. This is EITHER a genuine
-         * removal OR a false latch: the DISK CHANGE latch also reads LOW simply
-         * because the drive was deselected (motor idled) and reselected since
-         * the last access -- with the disk still in. Treating that as a removal
-         * spuriously unmounts a present disk (the host then sees "medium not
-         * present" mid-operation). Distinguish the two with a STEP probe, which
-         * is exactly how insertion is detected: a present disk clears the latch
-         * back HIGH, a removed one stays LOW. Only step on an active access
-         * (passive readiness polls must never move the head); a passive poll
-         * cannot confirm, so it leaves our belief unchanged and defers to the
-         * next active access. One step clears the latch, so a steady-state run
-         * of reads does not chatter. */
-        if (may_probe) {
-            ufi_step_pulse();
-            if (ufi_dskchg() == 1) {
-                ufi_media_seated = TRUE;  /* false alarm: disk still present */
-            } else {
-                ufi_media_seated = FALSE; /* confirmed removed */
-                ufi_probe_block_until =
-                    time_now() + time_ms(UFI_PROBE_COOLDOWN_MS);
-            }
-        }
-        /* else: passive poll -- keep believing seated until an active access
-         * can confirm with a step. */
+        /* Line LOW while we believed a disk seated: it was removed/changed. No
+         * step needed -- the latch reads LOW on its own. The drive MAINTAINS
+         * this latch across deselect (verified on HW: with a present, unchanged
+         * disk, DSKCHG stays HIGH on reselect even after a 6s idle/deselect), so
+         * a LOW here is a genuine removal or swap, never a deselect artifact.
+         * (A disk swap therefore latches LOW and is caught here; the subsequent
+         * active access then STEP-probes and re-detects the new disk.) Hold off
+         * insertion-probing for a cooldown so the host's removal-revalidation
+         * burst (READ CAPACITY / partition-table READ) does not immediately
+         * rattle the head chasing a disk that was just taken out. */
+        ufi_media_seated = FALSE;
+        ufi_probe_block_until = time_now() + time_ms(UFI_PROBE_COOLDOWN_MS);
     } else if (may_probe && (time_since(ufi_probe_block_until) >= 0)) {
         /* Believed empty and the host is actively accessing: pulse STEP to
          * clear the latch and see whether a disk has since been inserted. Rate-
