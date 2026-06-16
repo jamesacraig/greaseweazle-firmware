@@ -47,6 +47,30 @@ static bool_t handle_control_request(void)
         ep0.data_len = 2;
         memset(ep0.data, 0, ep0.data_len);
 
+#if MCU == AT32F4
+    } else if ((req->bmRequestType == 0x82)
+               && (req->bRequest == GET_STATUS)) {
+
+        /* GET_STATUS (Endpoint): 2 bytes, bit0 = Halt. */
+        ep0.data[0] = usb_ep_halted((uint8_t)req->wIndex) ? 1 : 0;
+        ep0.data[1] = 0;
+        ep0.data_len = 2;
+
+    } else if ((req->bmRequestType == 0x02)
+               && ((req->bRequest == CLEAR_FEATURE)
+                   || (req->bRequest == SET_FEATURE))
+               && (req->wValue == ENDPOINT_HALT)
+               && ((req->wIndex & 0x7f) != 0)) {
+
+        /* SET / CLEAR_FEATURE(ENDPOINT_HALT) on a bulk endpoint. Clearing also
+         * resets the data toggle to DATA0: this is how a host recovers a halted
+         * pipe, and the Bulk-Only mass-storage reset recovery does exactly this
+         * (class Bulk-Reset, then clear-halt on the IN and OUT bulk endpoints).
+         * Status-only request; nothing to do for EP0 (guarded above).
+         * AT32F4-only: the BOT/MSC personality and the only set_halt backend. */
+        usb_set_halt((uint8_t)req->wIndex, req->bRequest == SET_FEATURE);
+#endif
+
     } else if ((req->bmRequestType == 0x80)
                && (req->bRequest == GET_DESCRIPTOR)) {
 

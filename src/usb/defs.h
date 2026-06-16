@@ -22,6 +22,9 @@
 #define SET_INTERFACE      11
 #define SYNCH_FRAME        12
 
+/* Standard Feature Selectors (wValue of SET/CLEAR_FEATURE). */
+#define ENDPOINT_HALT       0
+
 /* Descriptor Types */
 #define DESC_DEVICE         1
 #define DESC_CONFIGURATION  2
@@ -100,7 +103,21 @@ struct usb_driver {
     void (*read)(uint8_t epnr, void *buf, uint32_t len);
     void (*write)(uint8_t epnr, const void *buf, uint32_t len);
     void (*stall)(uint8_t epnr);
+#if MCU == AT32F4
+    /* Set/clear endpoint HALT (clear also resets the data toggle to DATA0) and
+     * report HALT status, for SET/CLEAR_FEATURE(ENDPOINT_HALT) + GET_STATUS.
+     * `epnr` carries the direction bit (0x80=IN). Only the AT32F4 usbd backend
+     * implements these (the BOT/MSC personality is AT32F4-only); compiling them
+     * elsewhere is dead code and overflows the flash-tight STM32F1. */
+    void (*set_halt)(uint8_t epnr, bool_t set);
+    bool_t (*ep_halted)(uint8_t epnr);
+#endif
 };
+
+#if MCU == AT32F4
+void usb_set_halt(uint8_t ep, bool_t set);
+bool_t usb_ep_halted(uint8_t ep);
+#endif
 
 extern const struct usb_driver dwc_otg;
 extern const struct usb_driver usbd;

@@ -216,6 +216,35 @@ static void usbd_stall(uint8_t ep)
     usb->epr[ep] = epr;
 }
 
+/* Set or clear an endpoint HALT. `ep` carries the direction bit (0x80=IN), so
+ * we drive STAT_TX for an IN endpoint and STAT_RX for an OUT one. Same EPR
+ * toggle-write rules as usbd_write/usbd_read: a 1 in a STAT/DTOG field flips it,
+ * a 1 in a CTR (rc_w0) field preserves it. To CLEAR a halt we additionally
+ * reset the data toggle to DATA0 (keep the current DTOG bit in the write value
+ * so it flips to 0), as the spec requires after CLEAR_FEATURE(ENDPOINT_HALT). */
+static void usbd_set_halt(uint8_t ep, bool_t set)
+{
+    uint8_t epnr = ep & 0x7f;
+    uint16_t epr = usb->epr[epnr];
+    if (ep & 0x80) {                 /* IN endpoint: STAT_TX (and DTOG_TX) */
+        epr &= set ? 0x073f : (0x073f | USB_EPR_DTOG_TX);
+        epr |= 0x8080;
+        epr ^= USB_EPR_STAT_TX(set ? USB_STAT_STALL : USB_STAT_NAK);
+    } else {                         /* OUT endpoint: STAT_RX (and DTOG_RX) */
+        epr &= set ? 0x370f : (0x370f | USB_EPR_DTOG_RX);
+        epr |= 0x8080;
+        epr ^= USB_EPR_STAT_RX(set ? USB_STAT_STALL : USB_STAT_VALID);
+    }
+    usb->epr[epnr] = epr;
+}
+
+static bool_t usbd_ep_halted(uint8_t ep)
+{
+    uint16_t epr = usb->epr[ep & 0x7f];
+    uint16_t stat = (ep & 0x80) ? ((epr >> 4) & 3) : ((epr >> 12) & 3);
+    return stat == USB_STAT_STALL;
+}
+
 static void usbd_configure_ep(uint8_t epnr, uint8_t type, uint32_t size)
 {
     static const uint8_t types[] = {
@@ -526,7 +555,9 @@ const struct usb_driver usbd = {
     .ep_tx_ready = usbd_ep_tx_ready,
     .read = usbd_read,
     .write = usbd_write,
-    .stall = usbd_stall
+    .stall = usbd_stall,
+    .set_halt = usbd_set_halt,
+    .ep_halted = usbd_ep_halted
 };
 
 /*

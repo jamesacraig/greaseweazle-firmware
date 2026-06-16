@@ -89,6 +89,17 @@ void usb_stall(uint8_t epnr)
     drv->stall(epnr);
 }
 
+void usb_set_halt(uint8_t epnr, bool_t set)
+{
+    if (drv->set_halt)
+        drv->set_halt(epnr, set);
+}
+
+bool_t usb_ep_halted(uint8_t epnr)
+{
+    return drv->ep_halted ? drv->ep_halted(epnr) : FALSE;
+}
+
 void usb_configure_ep(uint8_t epnr, uint8_t type, uint32_t size)
 {
     drv->configure_ep(epnr, type, size);
